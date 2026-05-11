@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flocci-deploy
+  labels:
+    app: flocci
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flocci-pod
+  template:
+    metadata:
+      labels:
+        app: flocci-pod
+    spec:
+      containers:
+      - name: flocci-cont
+        image: hectorvent/floci:latest
+        ports:
+        - containerPort: 4566
+        env:
+          - name: FLOCI_HOSTNAME
+            value: flocci-service

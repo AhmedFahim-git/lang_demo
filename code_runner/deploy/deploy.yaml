@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runcode-deploy
+  labels:
+    app: runcode
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: runcode-pod
+  template:
+    metadata:
+      labels:
+        app: runcode-pod
+    spec:
+      runtimeClassName: kata-qemu
+      containers:
+      - name: runcode-cont
+        image: fahim03/run_code_service:latest
+        ports:
+        - containerPort: 8000
+        env:
+          - name: AWS_ENDPOINT_URL
+            value: http://flocci-service:4566
+          - name: AWS_DEFAULT_REGION
+            value: us-east-1
+          - name: AWS_ACCESS_KEY_ID
+            value: test
+          - name: AWS_SECRET_ACCESS_KEY
+            value: test

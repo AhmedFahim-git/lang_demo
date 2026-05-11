@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bucket-deploy
+  labels:
+    app: bucket
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bucket-pod
+  template:
+    metadata:
+      labels:
+        app: bucket-pod
+    spec:
+      containers:
+      - name: bucket-cont
+        image: fahim03/bucket_service:latest
+        ports:
+        - containerPort: 8000
+        env:
+          - name: AWS_ENDPOINT_URL
+            value: http://flocci-service:4566
+          - name: AWS_DEFAULT_REGION
+            value: us-east-1
+          - name: AWS_ACCESS_KEY_ID
+            value: test
+          - name: AWS_SECRET_ACCESS_KEY
+            value: test

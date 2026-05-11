@@ -1,0 +1,3 @@
+fastapi[standard]
+dill
+fsspec[s3]
