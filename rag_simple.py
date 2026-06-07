@@ -6,10 +6,11 @@ from langchain_openai import OpenAIEmbeddings
 
 # from elasticsearch import Elasticsearch, helpers
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic import SecretStr
 from qdrant_client import QdrantClient, models
 
 embedding_model = OpenAIEmbeddings(
-    model="Qwen0.6B", base_url="http://localhost:8080/v1/", api_key="None"
+    model="Qwen0.6B", base_url="http://localhost:8080/v1/", api_key=SecretStr("None")
 )
 
 client = QdrantClient(url="http://localhost:6333")

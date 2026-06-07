@@ -1,16 +1,23 @@
+from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Generator
 from copy import deepcopy
-from glob import glob
+from datetime import datetime, timezone
+from io import BytesIO
+from itertools import chain
 from typing import Any, Literal, Optional, Sequence
 
+import filetype
+import fsspec
+import pymongo
 import requests
+from docling.datamodel.base_models import DocumentStream
+from docling.document_converter import DocumentConverter
 from elasticsearch import Elasticsearch, helpers
 from elasticsearch.exceptions import NotFoundError
-from llama_index.core import (
-    SimpleDirectoryReader,
-)
+from llama_index.core import Document
 from llama_index.core.bridge.pydantic import Field, field_validator
+from llama_index.core.embeddings import BaseEmbedding
 from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.node_parser import MarkdownNodeParser, SentenceSplitter
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
@@ -26,10 +33,25 @@ from llama_index.core.vector_stores.utils import (
     metadata_dict_to_node,
     node_to_metadata_dict,
 )
+from llama_index.embeddings.openai_like import OpenAILikeEmbedding
 from llama_index.readers.docling import DoclingReader
+from pymongo import MongoClient
+from qdrant_client import QdrantClient, models
 
+# EMBED_MODEL = OpenAIEmbeddings(
+#     model="Qwen0.6B", base_url="http://localhost:8080/v1/", api_key=SecretStr("None")
+# )
+EMBED_MODEL = OpenAILikeEmbedding(
+    model_name="Qwen0.6B", api_base="http://localhost:8080/v1/"
+)
+EMBED_DIM = 1024
+
+# URI = f"mongodb://{os.environ['MONGO_INITDB_ROOT_USERNAME']}:{os.environ['MONGO_INITDB_ROOT_PASSWORD']}@{os.environ['MONGO_SERVICE_HOSTNAME']}:27017/?authSource=admin"  # "mongodb://root:example@localhost:27017/?authSource=admin"
+MONGO_URI = "mongodb://root:example@localhost:27017/?authSource=admin"
 ES_INDEX_NAME = "es_index"
 RERANK_BASE_URL = "http://localhost:8080/v1"
+QDRANT_URL = "http://localhost:6333"
+QDRANT_COLLECTION_NAME = "collection_name"
 
 
 def rerank_docs(
@@ -223,6 +245,10 @@ class MergeConsecutiveNodesPostprocessor(BaseNodePostprocessor):
         """Postprocess nodes."""
         all_nodes: dict[str, NodeWithScore] = {}
         for node in nodes:
+            if (node.node.node_id in all_nodes) and (
+                node.get_score() <= all_nodes[node.node.node_id].get_score()
+            ):
+                continue
             all_nodes[node.node.node_id] = node
         node_id_set = set(all_nodes.keys())
         new_list = []
@@ -248,13 +274,13 @@ class MergeConsecutiveNodesPostprocessor(BaseNodePostprocessor):
                                     prev_node_with_score.node.next_node.node_id
                                     == node_deque[0]
                                 )
+                            ), (
+                                f"{node_deque}\n Cur node: relation{node.relationships}, metadata{node.metadata}, content:{node.get_content(MetadataMode.NONE)}, ID: {node_id}\n Prev node: relation{prev_node_with_score.node.relationships} metadata: {prev_node_with_score.node.metadata}, content:{prev_node_with_score.node.get_content(MetadataMode.NONE)}, ID: {prev_node_id}"
                             )
                             node_deque.appendleft(prev_node_id)
-                            node_with_score = (
-                                MergeConsecutiveNodesPostprocessor._join_nodes(
-                                    prev_node_with_score=prev_node_with_score,
-                                    next_node_with_score=node_with_score,
-                                )
+                            node_with_score = self._join_nodes(
+                                prev_node_with_score=prev_node_with_score,
+                                next_node_with_score=node_with_score,
                             )
                             node = node_with_score.node
                             node_id_set.discard(prev_node_id)
@@ -279,11 +305,9 @@ class MergeConsecutiveNodesPostprocessor(BaseNodePostprocessor):
                                 )
                             )
                             node_deque.append(next_node_id)
-                            node_with_score = (
-                                MergeConsecutiveNodesPostprocessor._join_nodes(
-                                    prev_node_with_score=node_with_score,
-                                    next_node_with_score=next_node_with_score,
-                                )
+                            node_with_score = self._join_nodes(
+                                prev_node_with_score=node_with_score,
+                                next_node_with_score=next_node_with_score,
                             )
                             node = node_with_score.node
                             node_id_set.discard(next_node_id)
@@ -375,7 +399,7 @@ class PrevNextNodePostprocessor(BaseNodePostprocessor):
             all_nodes[node.node.node_id] = node
             if self.mode == "next":
                 all_nodes.update(
-                    PrevNextNodePostprocessor.get_for_back_nodes(
+                    self.get_for_back_nodes(
                         node,
                         self.num_nodes,
                         id_node_fn=self.id_node_fn,
@@ -384,7 +408,7 @@ class PrevNextNodePostprocessor(BaseNodePostprocessor):
                 )
             elif self.mode == "previous":
                 all_nodes.update(
-                    PrevNextNodePostprocessor.get_for_back_nodes(
+                    self.get_for_back_nodes(
                         node,
                         self.num_nodes,
                         id_node_fn=self.id_node_fn,
@@ -393,7 +417,7 @@ class PrevNextNodePostprocessor(BaseNodePostprocessor):
                 )
             elif self.mode == "both":
                 all_nodes.update(
-                    PrevNextNodePostprocessor.get_for_back_nodes(
+                    self.get_for_back_nodes(
                         node,
                         self.num_nodes,
                         id_node_fn=self.id_node_fn,
@@ -401,7 +425,7 @@ class PrevNextNodePostprocessor(BaseNodePostprocessor):
                     )
                 )
                 all_nodes.update(
-                    PrevNextNodePostprocessor.get_for_back_nodes(
+                    self.get_for_back_nodes(
                         node,
                         self.num_nodes,
                         id_node_fn=self.id_node_fn,
@@ -437,17 +461,102 @@ class PrevNextNodePostprocessor(BaseNodePostprocessor):
         return sorted_nodes
 
 
+# Adapted from https://github.com/run-llama/llama_index/blob/main/llama-index-core/llama_index/core/retrievers/fusion_retriever.py#L113
+def reciprocal_rerank_fusion(results: list[list[NodeWithScore]]) -> list[NodeWithScore]:
+    """
+    Apply reciprocal rank fusion.
+
+    The original paper uses k=60 for best results:
+    https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf
+    """
+    k = 60.0  # `k` is a parameter used to control the impact of outlier rankings.
+    fused_scores = {}
+    hash_to_node = {}
+
+    # compute reciprocal rank scores
+    for nodes_with_scores in results:
+        for rank, node_with_score in enumerate(
+            sorted(nodes_with_scores, key=lambda x: x.score or 0.0, reverse=True)
+        ):
+            hash = node_with_score.node.hash
+            hash_to_node[hash] = node_with_score
+            if hash not in fused_scores:
+                fused_scores[hash] = 0.0
+            fused_scores[hash] += 1.0 / (rank + k)
+
+    # sort results
+    reranked_results = dict(
+        sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+    )
+
+    # adjust node scores
+    reranked_nodes: list[NodeWithScore] = []
+    for hash, score in reranked_results.items():
+        reranked_nodes.append(hash_to_node[hash])
+        reranked_nodes[-1].score = score
+
+    return reranked_nodes
+
+
 pdf_reader = DoclingReader(export_type=DoclingReader.ExportType.MARKDOWN)
 
-files = []
-for file in glob("pdfs/*"):
-    files.append(file)
+converter = DocumentConverter()
+fs = fsspec.filesystem("s3", endpoint_url="http://localhost:4566")
+# fs = S3FileSystem(endpoint_url="http://localhost:4566")
+# remote_dir = "s3://my-bucket/pdfs/"  # TODO: refactor out bucket name
+# remote_dir = "my-bucket/pdfs/"
+excluded_metadata_keys = [
+    "file_name",
+    "file_type",
+    "file_size",
+    "creation_date",
+    "last_modified_date",
+    "last_accessed_date",
+]
+docs = []
+for file in fs.ls("my-bucket/pdfs/"):
+    print(file)
+    f_info = fs.info("s3://" + file)
+    print(f_info)
+    metadata = dict()
+    metadata["file_path"] = f_info.get("name")
+    metadata["file_name"] = file.split("/")[-1]
+    metadata["file_type"] = f_info.get("ContentType")
+    metadata["file_size"] = f_info.get("size")
+    metadata["creation_date"] = f_info.get(
+        "LastModified", datetime.now(timezone.utc)
+    ).isoformat()
+    metadata["last_modified_date"] = f_info.get(
+        "LastModified", datetime.now(timezone.utc)
+    ).isoformat()
+    metadata["last_accessed_date"] = datetime.now(timezone.utc).isoformat()
+    with fs.open(file) as f:
+        f_bytes = f.read()
+        if metadata["file_type"] is None:
+            metadata["file_type"] = filetype.guess_mime(f_bytes)
+        f_bytes = BytesIO(f_bytes)
+    loaded_doc = converter.convert(
+        DocumentStream(name=metadata["file_name"], stream=f_bytes)
+    )
+    doc = Document(text=loaded_doc.document.export_to_markdown(), metadata=metadata)
+    doc.excluded_llm_metadata_keys.extend(excluded_metadata_keys)
+    doc.excluded_embed_metadata_keys.extend(excluded_metadata_keys)
+    docs.append(doc)
+# files = []
+# for file in glob("pdfs/*"):
+#     files.append(file)
+#
+# dir_reader = SimpleDirectoryReader(
+#     input_files=files[:2], file_extractor={".pdf": pdf_reader}
+# )
+# dir_reader = SimpleDirectoryReader(
+#     input_dir=remote_dir, fs=fs, recursive=True, file_extractor={".pdf": pdf_reader}
+# )
 
-dir_reader = SimpleDirectoryReader(
-    input_files=files[:2], file_extractor={".pdf": pdf_reader}
-)
-
-docs = dir_reader.load_data()
+# docs = dir_reader.load_data()
+print(docs[0].node_id)
+print(docs[0].metadata)
+print(docs[0].hash)
 pipe = IngestionPipeline(
     transformations=[
         MarkdownNodeParser(),
@@ -456,13 +565,408 @@ pipe = IngestionPipeline(
 )
 nodes = pipe.run(documents=docs)
 
-relation_dict = dict()
-for node in nodes:
-    relation_dict.update(node.relationships)
+
+def postprocess_ingestion_nodes(nodes: Sequence[BaseNode]) -> Sequence[BaseNode]:
+    nodes = deepcopy(nodes)
+    for i in range(1, len(nodes)):
+        prev_node, next_node = nodes[i - 1], nodes[i]
+        if prev_node.metadata["file_path"] == next_node.metadata["file_path"]:
+            assert (
+                (NodeRelationship.NEXT in prev_node.relationships)
+                and prev_node.next_node.node_id == next_node.node_id
+            ) or (
+                (NodeRelationship.PREVIOUS in next_node.relationships)
+                and next_node.prev_node.node_id == prev_node.node_id
+            ), "At least one side should have the required relation"
+            prev_node.relationships[NodeRelationship.NEXT] = (
+                next_node.as_related_node_info()
+            )
+            next_node.relationships[NodeRelationship.PREVIOUS] = (
+                prev_node.as_related_node_info()
+            )
+    return nodes
 
 
-print(relation_dict)
+class MyBaseDocstore(ABC):
+    @abstractmethod
+    def get_nodes_diff(self, nodes: list[BaseNode]) -> dict[str, list[BaseNode]]: ...
+    @abstractmethod
+    def get_node(self, node_id: str) -> BaseNode | None: ...
+    @abstractmethod
+    def get_nodes(self, node_ids: list[str]) -> dict[str, BaseNode]: ...
 
+
+class MyMongoDocstore(MyBaseDocstore):
+    def __init__(
+        self,
+        uri: str = MONGO_URI,
+        database_name: str = "init_db_mongo",
+        doc_collection_name: str = "doc_collection_name",
+        node_collection_name: str = "node_collection_name",
+    ) -> None:
+        self.client = MongoClient(uri)
+        self.db = self.client.get_database(database_name)
+        self.doc_collection = self.db.get_collection(doc_collection_name)
+        self.node_collection = self.db.get_collection(node_collection_name)
+
+    def get_nodes_diff(self, nodes: list[BaseNode]) -> dict[str, list[BaseNode]]:
+        node_dict = {node.node_id: node for node in nodes}
+
+        docs_to_add = dict()
+        docs_to_delete = []
+        nodes_to_add = []
+        nodes_to_delete = []
+        for node in nodes:
+            if (NodeRelationship.SOURCE in node.relationships) and (
+                node.source_node is not None
+            ):
+                source_node = node.source_node
+                if self.doc_collection.find_one({"hash": source_node.hash}) is not None:
+                    # If doc matches we consider that it is already added
+                    continue
+                res = self.doc_collection.find_one(
+                    {
+                        "file_name": source_node.metadata.get("file_name"),
+                        "file_type": source_node.metadata.get("file_type"),
+                    }
+                )
+                if res is not None:
+                    if source_node.node_id not in docs_to_add:
+                        nodes_to_delete.extend(res.get("child_nodes", []))
+                        docs_to_delete.append(res.get("_id"))
+                if source_node.node_id not in docs_to_add:
+                    docs_to_add[source_node.node_id] = source_node.metadata | {
+                        "hash": source_node.hash,
+                        "child_nodes": [node.node_id],
+                    }
+                else:
+                    docs_to_add[source_node.node_id]["child_nodes"].append(node.node_id)
+            elif self.node_collection.find_one({"hash": node.hash}) is not None:
+                continue
+            nodes_to_add.append(
+                {
+                    "_id": node.node_id,
+                    "content": node.get_content(metadata_mode=MetadataMode.NONE),
+                    "metadata": node_to_metadata_dict(node, remove_text=True),
+                    "hash": node.hash,
+                }
+            )
+        doc_operations = [pymongo.DeleteMany({"_id": {"$in": docs_to_delete}})] + [
+            pymongo.InsertOne({"_id": k} | v) for k, v in docs_to_add.items()
+        ]
+        node_operations = [pymongo.DeleteMany({"_id": {"$in": nodes_to_delete}})] + [
+            pymongo.InsertOne(i) for i in nodes_to_add
+        ]
+        self.doc_collection.bulk_write(doc_operations)
+        self.node_collection.bulk_write(node_operations)
+        return {
+            "delete_nodes": [node_dict[i] for i in nodes_to_delete],
+            "add_nodes": [node_dict[i.get("_id")] for i in nodes_to_add],
+        }
+
+    def get_node(self, node_id: str) -> BaseNode | None:
+        res = self.node_collection.find_one({"_id": node_id})
+        if res is None:
+            return None
+        return metadata_dict_to_node(
+            metadata=res.get("metadata"), text=res.get("content")
+        )
+
+    def get_nodes(self, node_ids: list[str]) -> dict[str, BaseNode]:
+        res = self.node_collection.find({"_id": {"$in": node_ids}})
+        node_dict = dict()
+        for item in res:
+            node_dict[item.get("_id")] = metadata_dict_to_node(
+                metadata=item.get("metadata"), text=item.get("content")
+            )
+        return node_dict
+
+
+class BaseSearchStore(ABC):
+    @abstractmethod
+    def add_delete_nodes(
+        self, nodes_to_add: Sequence[BaseNode], nodes_to_delete: Sequence[BaseNode] = []
+    ) -> None: ...
+
+    @abstractmethod
+    def search_query(
+        self,
+        query: str,
+        node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]],
+        size: int = 5,
+    ) -> VectorStoreQueryResult: ...
+
+
+class ElasticsearchStore(BaseSearchStore):
+    def __init__(
+        self,
+        index_name: str = ES_INDEX_NAME,
+        ca_certs="http_ca.crt",
+        username: str = "elastic",
+        password: str = "yNZKq+=90SMk5yl-8y95",
+        delete_index_if_exists: bool = True,
+    ) -> None:
+        mappings = {
+            i: {
+                "type": "text",
+                "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+            }
+            for i in ["file_path", "file_name", "file_type"]
+        } | {"content": {"type": "text"}, "file_size": {"type": "integer"}}
+        self.index_name = index_name
+
+        self.client = Elasticsearch(
+            "https://localhost:9200",
+            ca_certs=ca_certs,
+            basic_auth=(username, password),
+        )
+
+        index_exist = self.client.indices.exists(index=self.index_name)
+
+        if index_exist and delete_index_if_exists:
+            self.client.indices.delete(index=self.index_name)
+            index_exist = False
+        if not index_exist:
+            self.client.indices.create(
+                index=self.index_name, mappings={"properties": mappings}
+            )
+
+    # Taken from https://github.com/run-llama/llama_index/blob/9aa5ee5cd2a1ecff6ffa2a8cd6af46b87af674b9/llama-index-integrations/vector_stores/llama-index-vector-stores-elasticsearch/llama_index/vector_stores/elasticsearch/base.py
+    @staticmethod
+    def _to_llama_similarities(scores: list[float]) -> list[float]:
+        if not scores:
+            return []
+        min_score = min(scores)
+        max_score = max(scores)
+        if max_score == min_score:
+            return [1.0 if max_score > 0 else 0.0 for _ in scores]
+        return [(x - min_score) / (max_score - min_score) for x in scores]
+
+    def _generate_docs_to_add(
+        self, nodes: Sequence[BaseNode]
+    ) -> Generator[dict[str, Any]]:
+        for node in nodes:
+            yield {
+                "_index": self.index_name,
+                "_id": node.node_id,
+                "content": node.get_content(metadata_mode=MetadataMode.NONE),
+                "file_path": node.metadata.get("file_path"),
+                "file_name": node.metadata.get("file_name"),
+                "file_type": node.metadata.get("file_type"),
+                "file_size": node.metadata.get("file_size"),
+            }
+
+    def _generate_docs_to_delete(
+        self,
+        nodes: Sequence[BaseNode],
+    ) -> Generator[dict[str, Any]]:
+        for node in nodes:
+            yield {"_op_type": "delete", "_index": self.index_name, "_id": node.node_id}
+
+    def add_delete_nodes(
+        self, nodes_to_add: Sequence[BaseNode], nodes_to_delete: Sequence[BaseNode] = []
+    ) -> None:
+        helpers.bulk(
+            client=self.client,
+            actions=chain(
+                self._generate_docs_to_delete(nodes_to_delete),
+                self._generate_docs_to_add(nodes=nodes_to_add),
+            ),
+            refresh=True,
+        )
+
+    @staticmethod
+    def _es_hits_to_query_result(
+        hits: list[dict], node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]]
+    ) -> VectorStoreQueryResult:
+        top_scores = []
+        top_ids = []
+        for hit in hits:
+            top_ids.append(hit["_id"])
+            top_scores.append(hit["_score"])
+        node_dict = node_fetch_fn(top_ids)
+        top_nodes = [node_dict[i] for i in top_ids]
+
+        return VectorStoreQueryResult(
+            nodes=top_nodes,
+            similarities=ElasticsearchStore._to_llama_similarities(top_scores),
+            ids=top_ids,
+        )
+
+    def search_query(
+        self,
+        query: str,
+        node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]],
+        size: int = 5,
+    ) -> VectorStoreQueryResult:
+        results = self.client.search(
+            index=self.index_name,
+            query={"match": {"content": query}},
+            size=size,
+        )
+        return self._es_hits_to_query_result(
+            hits=results["hits"]["hits"], node_fetch_fn=node_fetch_fn
+        )
+
+    def search_detailed_es_query(
+        self,
+        query: dict,
+        node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]],
+        size: int = 5,
+    ) -> VectorStoreQueryResult:
+        results = self.client.search(
+            index=self.index_name,
+            query=query,
+            size=size,
+        )
+        return self._es_hits_to_query_result(
+            hits=results["hits"]["hits"], node_fetch_fn=node_fetch_fn
+        )
+
+
+class QdrantStore(BaseSearchStore):
+    def __init__(
+        self,
+        url: str = QDRANT_URL,
+        collection_name: str = QDRANT_COLLECTION_NAME,
+        embedding_model: BaseEmbedding = EMBED_MODEL,
+        embedding_dim: int = EMBED_DIM,
+        delete_collection_if_exists: bool = True,
+    ):
+        self.client = QdrantClient(url=url)
+        self.collection_name = collection_name
+        col_exist = self.client.collection_exists(collection_name=self.collection_name)
+        if col_exist and delete_collection_if_exists:
+            self.client.delete_collection(collection_name=self.collection_name)
+            col_exist = False
+        if not col_exist:
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=models.VectorParams(
+                    size=embedding_dim, distance=models.Distance.COSINE
+                ),
+                hnsw_config=models.HnswConfigDiff(m=16),
+            )
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="file_name",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="file_path",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="file_type",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="file_size",
+                field_schema=models.PayloadSchemaType.INTEGER,
+            )
+        self.embedding_model = embedding_model
+
+    def add_delete_nodes(
+        self, nodes_to_add: Sequence[BaseNode], nodes_to_delete: Sequence[BaseNode] = []
+    ) -> None:
+        self.client.update_collection(
+            collection_name=self.collection_name, hnsw_config=models.HnswConfigDiff(m=0)
+        )
+        vectors = self.embedding_model.get_text_embedding_batch(
+            [i.get_content(metadata_mode=MetadataMode.EMBED) for i in nodes_to_add]
+        )
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=models.PointIdsList(
+                points=[i.node_id for i in nodes_to_delete]
+            ),
+        )
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=[
+                models.PointStruct(
+                    id=node.node_id,
+                    vector=vectors[i],
+                    payload={
+                        "file_path": node.metadata.get("file_path"),
+                        "file_name": node.metadata.get("file_name"),
+                        "file_type": node.metadata.get("file_type"),
+                        "file_size": node.metadata.get("file_size"),
+                    },
+                )
+                for i, node in enumerate(nodes_to_add)
+            ],
+        )
+        self.client.update_collection(
+            collection_name=self.collection_name,
+            hnsw_config=models.HnswConfigDiff(m=16),
+        )
+
+    @staticmethod
+    def _qdrant_points_to_query_result(
+        points: list[models.ScoredPoint],
+        node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]],
+    ) -> VectorStoreQueryResult:
+        top_scores = []
+        top_ids = []
+        for point in points:
+            point = point.model_dump()
+            top_ids.append(point["id"])
+            top_scores.append(point["score"])
+        node_dict = node_fetch_fn(top_ids)
+        top_nodes = [node_dict[i] for i in top_ids]
+
+        return VectorStoreQueryResult(
+            nodes=top_nodes,
+            similarities=top_scores,
+            ids=top_ids,
+        )
+
+    def search_query(
+        self,
+        query: str,
+        node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]],
+        size: int = 5,
+    ) -> VectorStoreQueryResult:
+        results = self.client.query_points(
+            collection_name=self.collection_name,
+            query=self.embedding_model.get_text_embedding(query),
+            limit=size,
+        )
+        return self._qdrant_points_to_query_result(
+            points=results.points, node_fetch_fn=node_fetch_fn
+        )
+
+    def search_detailed_qdrant_query(
+        self,
+        query: str,
+        node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]],
+        query_filter: models.Filter | None = None,
+        search_params: models.SearchParams | None = None,
+        size: int = 5,
+    ) -> VectorStoreQueryResult:
+        results = self.client.query_points(
+            collection_name=self.collection_name,
+            query=self.embedding_model.get_text_embedding(query),
+            limit=size,
+            query_filter=query_filter,
+            search_params=search_params,
+        )
+        return self._qdrant_points_to_query_result(
+            points=results.points, node_fetch_fn=node_fetch_fn
+        )
+
+
+nodes = postprocess_ingestion_nodes(nodes=nodes)
+
+print(nodes[0].get_content(MetadataMode.NONE))
+print(nodes[0].metadata)
+print(nodes[0].hash)
+print(nodes[0].node_id)
+print(nodes[0].relationships)
 
 # print('"' + nodes[0].get_content() + '"')
 # print('"' + nodes[1].get_content() + '"')
