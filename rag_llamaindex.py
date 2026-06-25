@@ -3,9 +3,10 @@ from collections import deque
 from collections.abc import Callable, Generator
 from copy import deepcopy
 from datetime import datetime, timezone
+from functools import reduce
 from io import BytesIO
 from itertools import chain
-from typing import Any, Literal, Optional, Sequence
+from typing import Any, Literal, NamedTuple, Optional, Sequence
 
 import filetype
 import fsspec
@@ -15,6 +16,7 @@ from docling.datamodel.base_models import DocumentStream
 from docling.document_converter import DocumentConverter
 from elasticsearch import Elasticsearch, helpers
 from elasticsearch.exceptions import NotFoundError
+from fastapi import FastAPI
 from llama_index.core import Document
 from llama_index.core.bridge.pydantic import Field, field_validator
 from llama_index.core.embeddings import BaseEmbedding
@@ -27,6 +29,7 @@ from llama_index.core.schema import (
     NodeRelationship,
     NodeWithScore,
     QueryBundle,
+    TextNode,
 )
 from llama_index.core.vector_stores.types import VectorStoreQueryResult
 from llama_index.core.vector_stores.utils import (
@@ -34,13 +37,10 @@ from llama_index.core.vector_stores.utils import (
     node_to_metadata_dict,
 )
 from llama_index.embeddings.openai_like import OpenAILikeEmbedding
-from llama_index.readers.docling import DoclingReader
+from pydantic import BaseModel
 from pymongo import MongoClient
 from qdrant_client import QdrantClient, models
 
-# EMBED_MODEL = OpenAIEmbeddings(
-#     model="Qwen0.6B", base_url="http://localhost:8080/v1/", api_key=SecretStr("None")
-# )
 EMBED_MODEL = OpenAILikeEmbedding(
     model_name="Qwen0.6B", api_base="http://localhost:8080/v1/"
 )
@@ -49,9 +49,10 @@ EMBED_DIM = 1024
 # URI = f"mongodb://{os.environ['MONGO_INITDB_ROOT_USERNAME']}:{os.environ['MONGO_INITDB_ROOT_PASSWORD']}@{os.environ['MONGO_SERVICE_HOSTNAME']}:27017/?authSource=admin"  # "mongodb://root:example@localhost:27017/?authSource=admin"
 MONGO_URI = "mongodb://root:example@localhost:27017/?authSource=admin"
 ES_INDEX_NAME = "es_index"
-RERANK_BASE_URL = "http://localhost:8080/v1"
+RERANK_BASE_URL = "http://localhost:8081/v1"
 QDRANT_URL = "http://localhost:6333"
 QDRANT_COLLECTION_NAME = "collection_name"
+app = FastAPI()
 
 
 def rerank_docs(
@@ -67,7 +68,7 @@ def rerank_docs(
 
 def rerank_nodes(
     query: str,
-    nodes: list[NodeWithScore],
+    nodes: Sequence[NodeWithScore],
     top_k: int | None = None,
     base_url: str = RERANK_BASE_URL,
 ) -> list[NodeWithScore]:
@@ -189,6 +190,16 @@ class LlamaElasticsearch:
             return None
 
 
+def dedup_nodes_with_score(nodes: Sequence[NodeWithScore]) -> list[NodeWithScore]:
+    hash_dict: dict[str, NodeWithScore] = dict()
+    for node in nodes:
+        hash = node.node.hash
+        if (hash in hash_dict) and (hash_dict[hash].get_score() > node.get_score()):
+            continue
+        hash_dict[hash] = node
+    return sorted(list(hash_dict.values()), key=lambda x: x.get_score(), reverse=True)
+
+
 class MergeConsecutiveNodesPostprocessor(BaseNodePostprocessor):
     @classmethod
     def class_name(cls) -> str:
@@ -200,8 +211,10 @@ class MergeConsecutiveNodesPostprocessor(BaseNodePostprocessor):
     ) -> NodeWithScore:
         prev_node_with_score = deepcopy(prev_node_with_score)
         prev_node = prev_node_with_score.node
+        assert isinstance(prev_node, TextNode)
         prev_node_start_end = prev_node.get_node_info()
         next_node = next_node_with_score.node
+        assert isinstance(next_node, TextNode)
         next_node_start_end = next_node.get_node_info()
         if (prev_node_start_end.get("end") is not None) and (
             next_node_start_end.get("start") is not None
@@ -243,13 +256,16 @@ class MergeConsecutiveNodesPostprocessor(BaseNodePostprocessor):
         query_bundle: Optional[QueryBundle] = None,
     ) -> list[NodeWithScore]:
         """Postprocess nodes."""
-        all_nodes: dict[str, NodeWithScore] = {}
-        for node in nodes:
-            if (node.node.node_id in all_nodes) and (
-                node.get_score() <= all_nodes[node.node.node_id].get_score()
-            ):
-                continue
-            all_nodes[node.node.node_id] = node
+        nodes = dedup_nodes_with_score(nodes=nodes)
+        all_nodes: dict[str, NodeWithScore] = {
+            node.node.node_id: node for node in nodes
+        }
+        # for node in nodes:
+        #     if (node.node.node_id in all_nodes) and (
+        #         node.get_score() <= all_nodes[node.node.node_id].get_score()
+        #     ):
+        #         continue
+        #     all_nodes[node.node.node_id] = node
         node_id_set = set(all_nodes.keys())
         new_list = []
         while node_id_set:
@@ -462,7 +478,9 @@ class PrevNextNodePostprocessor(BaseNodePostprocessor):
 
 
 # Adapted from https://github.com/run-llama/llama_index/blob/main/llama-index-core/llama_index/core/retrievers/fusion_retriever.py#L113
-def reciprocal_rerank_fusion(results: list[list[NodeWithScore]]) -> list[NodeWithScore]:
+def reciprocal_rerank_fusion(
+    results: Sequence[Sequence[NodeWithScore]],
+) -> list[NodeWithScore]:
     """
     Apply reciprocal rank fusion.
 
@@ -498,29 +516,27 @@ def reciprocal_rerank_fusion(results: list[list[NodeWithScore]]) -> list[NodeWit
     return reranked_nodes
 
 
-pdf_reader = DoclingReader(export_type=DoclingReader.ExportType.MARKDOWN)
+# fs = fsspec.filesystem("s3", endpoint_url="http://localhost:4566")
+# converter = DocumentConverter()
 
-converter = DocumentConverter()
-fs = fsspec.filesystem("s3", endpoint_url="http://localhost:4566")
-# fs = S3FileSystem(endpoint_url="http://localhost:4566")
-# remote_dir = "s3://my-bucket/pdfs/"  # TODO: refactor out bucket name
-# remote_dir = "my-bucket/pdfs/"
-excluded_metadata_keys = [
-    "file_name",
-    "file_type",
-    "file_size",
-    "creation_date",
-    "last_modified_date",
-    "last_accessed_date",
-]
-docs = []
-for file in fs.ls("my-bucket/pdfs/"):
-    print(file)
-    f_info = fs.info("s3://" + file)
-    print(f_info)
+
+def get_doc_from_fpath(
+    file_path: str,
+    fs: fsspec.AbstractFileSystem,
+    converter: DocumentConverter,
+) -> Document:
+    excluded_metadata_keys = [
+        "file_name",
+        "file_type",
+        "file_size",
+        "creation_date",
+        "last_modified_date",
+        "last_accessed_date",
+    ]
+    f_info = fs.info(file_path)
     metadata = dict()
     metadata["file_path"] = f_info.get("name")
-    metadata["file_name"] = file.split("/")[-1]
+    metadata["file_name"] = file_path.split("/")[-1]
     metadata["file_type"] = f_info.get("ContentType")
     metadata["file_size"] = f_info.get("size")
     metadata["creation_date"] = f_info.get(
@@ -529,9 +545,11 @@ for file in fs.ls("my-bucket/pdfs/"):
     metadata["last_modified_date"] = f_info.get(
         "LastModified", datetime.now(timezone.utc)
     ).isoformat()
-    metadata["last_accessed_date"] = datetime.now(timezone.utc).isoformat()
-    with fs.open(file) as f:
+    # The issue is that using datetime.now is problematic as datetime changes each time ingestion is done. So node hash changes even if node content did not change.
+    # metadata["last_accessed_date"] = datetime.now(timezone.utc).isoformat()
+    with fs.open(file_path, "rb") as f:
         f_bytes = f.read()
+        assert isinstance(f_bytes, bytes)
         if metadata["file_type"] is None:
             metadata["file_type"] = filetype.guess_mime(f_bytes)
         f_bytes = BytesIO(f_bytes)
@@ -541,29 +559,18 @@ for file in fs.ls("my-bucket/pdfs/"):
     doc = Document(text=loaded_doc.document.export_to_markdown(), metadata=metadata)
     doc.excluded_llm_metadata_keys.extend(excluded_metadata_keys)
     doc.excluded_embed_metadata_keys.extend(excluded_metadata_keys)
-    docs.append(doc)
-# files = []
-# for file in glob("pdfs/*"):
-#     files.append(file)
-#
-# dir_reader = SimpleDirectoryReader(
-#     input_files=files[:2], file_extractor={".pdf": pdf_reader}
-# )
-# dir_reader = SimpleDirectoryReader(
-#     input_dir=remote_dir, fs=fs, recursive=True, file_extractor={".pdf": pdf_reader}
-# )
+    return doc
 
-# docs = dir_reader.load_data()
-print(docs[0].node_id)
-print(docs[0].metadata)
-print(docs[0].hash)
-pipe = IngestionPipeline(
-    transformations=[
-        MarkdownNodeParser(),
-        SentenceSplitter(chunk_size=100, chunk_overlap=50),
-    ]
-)
-nodes = pipe.run(documents=docs)
+
+def get_docs_from_dir(
+    dir_name: str,
+    fs: fsspec.AbstractFileSystem,
+    converter: DocumentConverter,
+) -> list[Document]:
+    docs = []
+    for file in fs.ls(dir_name):
+        docs.append(get_doc_from_fpath(file_path=file, fs=fs, converter=converter))
+    return docs
 
 
 def postprocess_ingestion_nodes(nodes: Sequence[BaseNode]) -> Sequence[BaseNode]:
@@ -573,10 +580,12 @@ def postprocess_ingestion_nodes(nodes: Sequence[BaseNode]) -> Sequence[BaseNode]
         if prev_node.metadata["file_path"] == next_node.metadata["file_path"]:
             assert (
                 (NodeRelationship.NEXT in prev_node.relationships)
-                and prev_node.next_node.node_id == next_node.node_id
+                and (prev_node.next_node is not None)
+                and (prev_node.next_node.node_id == next_node.node_id)
             ) or (
                 (NodeRelationship.PREVIOUS in next_node.relationships)
-                and next_node.prev_node.node_id == prev_node.node_id
+                and (next_node.prev_node is not None)
+                and (next_node.prev_node.node_id == prev_node.node_id)
             ), "At least one side should have the required relation"
             prev_node.relationships[NodeRelationship.NEXT] = (
                 next_node.as_related_node_info()
@@ -587,16 +596,36 @@ def postprocess_ingestion_nodes(nodes: Sequence[BaseNode]) -> Sequence[BaseNode]
     return nodes
 
 
-class MyBaseDocstore(ABC):
+class NodeDiff(NamedTuple):
+    node_ids_delete: list[str]
+    nodes_add: list[BaseNode]
+
+
+class BaseDocstore(ABC):
     @abstractmethod
-    def get_nodes_diff(self, nodes: list[BaseNode]) -> dict[str, list[BaseNode]]: ...
+    def get_nodes_diff(self, nodes: Sequence[BaseNode]) -> NodeDiff: ...
     @abstractmethod
     def get_node(self, node_id: str) -> BaseNode | None: ...
     @abstractmethod
     def get_nodes(self, node_ids: list[str]) -> dict[str, BaseNode]: ...
+    @abstractmethod
+    def get_all_node_ids(self) -> set[str]: ...
 
 
-class MyMongoDocstore(MyBaseDocstore):
+# def get_node_hash(node: BaseNode) -> str:
+#     metadata_keys_to_use: list[str] = ["file_name", "file_type", "file_size"]
+#     metadata_str = node.metadata_separator.join(
+#         [
+#             node.metadata_template.format(key=key, value=str(value))
+#             for key, value in node.metadata.items()
+#             if key in metadata_keys_to_use
+#         ]
+#     )
+#     doc_identity = str(node.get_content(metadata_mode=MetadataMode.NONE)) + metadata_str
+#     return str(sha256(doc_identity.encode("utf-8", "surrogatepass")).hexdigest())
+
+
+class MongoDocstore(BaseDocstore):
     def __init__(
         self,
         uri: str = MONGO_URI,
@@ -609,8 +638,10 @@ class MyMongoDocstore(MyBaseDocstore):
         self.doc_collection = self.db.get_collection(doc_collection_name)
         self.node_collection = self.db.get_collection(node_collection_name)
 
-    def get_nodes_diff(self, nodes: list[BaseNode]) -> dict[str, list[BaseNode]]:
+    def get_nodes_diff(self, nodes: Sequence[BaseNode]) -> NodeDiff:
         node_dict = {node.node_id: node for node in nodes}
+        print("num items in doc collection", self.doc_collection.count_documents({}))
+        print("num items in node collection", self.node_collection.count_documents({}))
 
         docs_to_add = dict()
         docs_to_delete = []
@@ -651,18 +682,63 @@ class MyMongoDocstore(MyBaseDocstore):
                     "hash": node.hash,
                 }
             )
-        doc_operations = [pymongo.DeleteMany({"_id": {"$in": docs_to_delete}})] + [
-            pymongo.InsertOne({"_id": k} | v) for k, v in docs_to_add.items()
-        ]
-        node_operations = [pymongo.DeleteMany({"_id": {"$in": nodes_to_delete}})] + [
-            pymongo.InsertOne(i) for i in nodes_to_add
-        ]
-        self.doc_collection.bulk_write(doc_operations)
-        self.node_collection.bulk_write(node_operations)
-        return {
-            "delete_nodes": [node_dict[i] for i in nodes_to_delete],
-            "add_nodes": [node_dict[i.get("_id")] for i in nodes_to_add],
-        }
+        doc_operations = []
+        if docs_to_delete:
+            doc_operations.append(pymongo.DeleteMany({"_id": {"$in": docs_to_delete}}))
+        if docs_to_add:
+            doc_operations.extend(
+                [pymongo.InsertOne({"_id": k} | v) for k, v in docs_to_add.items()]
+            )
+        # doc_operations = [pymongo.DeleteMany({"_id": {"$in": docs_to_delete}})] + [
+        #     pymongo.InsertOne({"_id": k} | v) for k, v in docs_to_add.items()
+        # ]
+        node_operations = []
+        if nodes_to_delete:
+            node_operations.append(
+                pymongo.DeleteMany({"_id": {"$in": nodes_to_delete}})
+            )
+        if nodes_to_add:
+            node_operations.extend([pymongo.InsertOne(i) for i in nodes_to_add])
+        # node_operations = [pymongo.DeleteMany({"_id": {"$in": nodes_to_delete}})] + [
+        #     pymongo.InsertOne(i) for i in nodes_to_add
+        # ]
+        print(
+            f"before docstore operations. Doc operations: {len(doc_operations)}\nNode operations:{len(node_operations)}"
+        )
+        # dict_return = {
+        #     "delete_nodes": list(self.get_nodes(nodes_to_delete).values()),
+        #     "add_nodes": [node_dict[i.get("_id")] for i in nodes_to_add],
+        # }
+        try:
+            if doc_operations:
+                self.doc_collection.bulk_write(doc_operations)
+                print("doc operations done")
+            if node_operations:
+                self.node_collection.bulk_write(node_operations)
+                print("node operations done")
+        except Exception as e:
+            print(e)
+        print("num items in doc  collection", self.doc_collection.count_documents({}))
+        print("num items in node collection", self.node_collection.count_documents({}))
+        print("Len nodes_to_delete", len(nodes_to_delete))
+        print("Len nodes_to_add", len(nodes_to_add))
+        # print(
+        #     "Number of nodes to delete:", len([node_dict[i] for i in nodes_to_delete])
+        # )
+        # print(
+        #     "Number of nodes to add:",
+        #     len([node_dict[i.get("_id")] for i in nodes_to_add]),
+        # )
+        # dict_return = {
+        #     "delete_nodes": [node_dict[i] for i in nodes_to_delete],
+        #     "add_nodes": [node_dict[i.get("_id")] for i in nodes_to_add],
+        # }
+        # print("in mango", dict_return)
+        node_diff_return = NodeDiff(
+            node_ids_delete=nodes_to_delete,
+            nodes_add=[node_dict[i.get("_id")] for i in nodes_to_add],
+        )
+        return node_diff_return
 
     def get_node(self, node_id: str) -> BaseNode | None:
         res = self.node_collection.find_one({"_id": node_id})
@@ -681,11 +757,16 @@ class MyMongoDocstore(MyBaseDocstore):
             )
         return node_dict
 
+    def get_all_node_ids(self) -> set[str]:
+        return {doc["_id"] for doc in self.node_collection.find({}, {"_id": 1})}
+
 
 class BaseSearchStore(ABC):
     @abstractmethod
     def add_delete_nodes(
-        self, nodes_to_add: Sequence[BaseNode], nodes_to_delete: Sequence[BaseNode] = []
+        self,
+        nodes_to_add: Sequence[BaseNode] = [],
+        node_ids_to_delete: Sequence[str] = [],
     ) -> None: ...
 
     @abstractmethod
@@ -696,6 +777,13 @@ class BaseSearchStore(ABC):
         size: int = 5,
     ) -> VectorStoreQueryResult: ...
 
+    @abstractmethod
+    def sync(
+        self,
+        ground_truth: set[str],
+        node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]],
+    ) -> None: ...
+
 
 class ElasticsearchStore(BaseSearchStore):
     def __init__(
@@ -703,8 +791,8 @@ class ElasticsearchStore(BaseSearchStore):
         index_name: str = ES_INDEX_NAME,
         ca_certs="http_ca.crt",
         username: str = "elastic",
-        password: str = "yNZKq+=90SMk5yl-8y95",
-        delete_index_if_exists: bool = True,
+        password: str = "KXW-oa-1CH+cJu7ODM35",
+        delete_index_if_exists: bool = False,
     ) -> None:
         mappings = {
             i: {
@@ -722,6 +810,7 @@ class ElasticsearchStore(BaseSearchStore):
         )
 
         index_exist = self.client.indices.exists(index=self.index_name)
+        print(index_exist)
 
         if index_exist and delete_index_if_exists:
             self.client.indices.delete(index=self.index_name)
@@ -730,6 +819,7 @@ class ElasticsearchStore(BaseSearchStore):
             self.client.indices.create(
                 index=self.index_name, mappings={"properties": mappings}
             )
+        print("Init Es document count:", self.client.count(index=self.index_name))
 
     # Taken from https://github.com/run-llama/llama_index/blob/9aa5ee5cd2a1ecff6ffa2a8cd6af46b87af674b9/llama-index-integrations/vector_stores/llama-index-vector-stores-elasticsearch/llama_index/vector_stores/elasticsearch/base.py
     @staticmethod
@@ -758,22 +848,35 @@ class ElasticsearchStore(BaseSearchStore):
 
     def _generate_docs_to_delete(
         self,
-        nodes: Sequence[BaseNode],
+        node_ids: Sequence[str],
     ) -> Generator[dict[str, Any]]:
-        for node in nodes:
-            yield {"_op_type": "delete", "_index": self.index_name, "_id": node.node_id}
+        for node_id in node_ids:
+            yield {"_op_type": "delete", "_index": self.index_name, "_id": node_id}
 
     def add_delete_nodes(
-        self, nodes_to_add: Sequence[BaseNode], nodes_to_delete: Sequence[BaseNode] = []
+        self,
+        nodes_to_add: Sequence[BaseNode] = [],
+        node_ids_to_delete: Sequence[str] = [],
     ) -> None:
-        helpers.bulk(
-            client=self.client,
-            actions=chain(
-                self._generate_docs_to_delete(nodes_to_delete),
-                self._generate_docs_to_add(nodes=nodes_to_add),
-            ),
-            refresh=True,
+        print("Es document before count:", self.client.count(index=self.index_name))
+        print(
+            f"Num nodes to delete: {len(node_ids_to_delete)}, Num nodes to add: {len(nodes_to_add)}"
         )
+        actions = []
+        if node_ids_to_delete:
+            actions.append(self._generate_docs_to_delete(node_ids=node_ids_to_delete))
+        if nodes_to_add:
+            actions.append(self._generate_docs_to_add(nodes=nodes_to_add))
+        if actions:
+            print("Es actions", actions)
+            helpers.bulk(
+                client=self.client,
+                actions=chain(*actions),
+                refresh=True,
+                ignore_status=404,
+            )
+            print("actions done")
+        print("Es document after count:", self.client.count(index=self.index_name))
 
     @staticmethod
     def _es_hits_to_query_result(
@@ -799,6 +902,7 @@ class ElasticsearchStore(BaseSearchStore):
         node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]],
         size: int = 5,
     ) -> VectorStoreQueryResult:
+        print("Es document count:", self.client.count(index=self.index_name))
         results = self.client.search(
             index=self.index_name,
             query={"match": {"content": query}},
@@ -823,6 +927,39 @@ class ElasticsearchStore(BaseSearchStore):
             hits=results["hits"]["hits"], node_fetch_fn=node_fetch_fn
         )
 
+    def sync(
+        self,
+        ground_truth: set[str],
+        node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]],
+    ) -> None:
+        es_nodes: set[str] = {
+            doc["_id"]
+            for doc in helpers.scan(
+                client=self.client,
+                index=self.index_name,
+                query={"query": {"match_all": {}}},
+                _source=False,
+            )
+        }
+        node_ids_to_delete = list(es_nodes - ground_truth)
+        nodes_to_add = list(node_fetch_fn(list(ground_truth - es_nodes)).values())
+        self.add_delete_nodes(
+            nodes_to_add=nodes_to_add, node_ids_to_delete=node_ids_to_delete
+        )
+        # actions = []
+        # if nodes_to_delete:
+        #     actions.append(self._generate_docs_to_delete(node_ids=nodes_to_delete))
+        # if nodes_to_add:
+        #     actions.append(self._generate_docs_to_add(nodes=nodes_to_add))
+        # if actions:
+        #     print("Es actions", actions)
+        #     helpers.bulk(
+        #         client=self.client,
+        #         actions=chain(*actions),
+        #         refresh=True,
+        #         ignore_status=404,
+        #     )
+
 
 class QdrantStore(BaseSearchStore):
     def __init__(
@@ -831,7 +968,7 @@ class QdrantStore(BaseSearchStore):
         collection_name: str = QDRANT_COLLECTION_NAME,
         embedding_model: BaseEmbedding = EMBED_MODEL,
         embedding_dim: int = EMBED_DIM,
-        delete_collection_if_exists: bool = True,
+        delete_collection_if_exists: bool = False,
     ):
         self.client = QdrantClient(url=url)
         self.collection_name = collection_name
@@ -870,39 +1007,80 @@ class QdrantStore(BaseSearchStore):
         self.embedding_model = embedding_model
 
     def add_delete_nodes(
-        self, nodes_to_add: Sequence[BaseNode], nodes_to_delete: Sequence[BaseNode] = []
+        self,
+        nodes_to_add: Sequence[BaseNode] = [],
+        node_ids_to_delete: Sequence[str] = [],
     ) -> None:
+        print(
+            "Qdrant collection info pre:",
+            self.client.get_collection(collection_name=self.collection_name),
+        )
         self.client.update_collection(
             collection_name=self.collection_name, hnsw_config=models.HnswConfigDiff(m=0)
         )
-        vectors = self.embedding_model.get_text_embedding_batch(
-            [i.get_content(metadata_mode=MetadataMode.EMBED) for i in nodes_to_add]
-        )
-        self.client.delete(
-            collection_name=self.collection_name,
-            points_selector=models.PointIdsList(
-                points=[i.node_id for i in nodes_to_delete]
-            ),
-        )
-        self.client.upsert(
-            collection_name=self.collection_name,
-            points=[
-                models.PointStruct(
-                    id=node.node_id,
-                    vector=vectors[i],
-                    payload={
-                        "file_path": node.metadata.get("file_path"),
-                        "file_name": node.metadata.get("file_name"),
-                        "file_type": node.metadata.get("file_type"),
-                        "file_size": node.metadata.get("file_size"),
-                    },
+        actions: list[models.UpdateOperation] = []
+        if node_ids_to_delete:
+            actions.append(
+                models.DeleteOperation(
+                    delete=models.PointIdsList(points=list(node_ids_to_delete))
                 )
-                for i, node in enumerate(nodes_to_add)
-            ],
-        )
+            )
+            # self.client.delete(
+            #     collection_name=self.collection_name,
+            #     points_selector=models.PointIdsList(
+            #         points=[i.node_id for i in nodes_to_delete]
+            #     ),
+            # )
+        if nodes_to_add:
+            vectors = self.embedding_model.get_text_embedding_batch(
+                [i.get_content(metadata_mode=MetadataMode.EMBED) for i in nodes_to_add]
+            )
+            actions.append(
+                models.UpsertOperation(
+                    upsert=models.PointsList(
+                        points=[
+                            models.PointStruct(
+                                id=node.node_id,
+                                vector=vectors[i],
+                                payload={
+                                    "file_path": node.metadata.get("file_path"),
+                                    "file_name": node.metadata.get("file_name"),
+                                    "file_type": node.metadata.get("file_type"),
+                                    "file_size": node.metadata.get("file_size"),
+                                },
+                            )
+                            for i, node in enumerate(nodes_to_add)
+                        ]
+                    )
+                )
+            )
+            # self.client.upsert(
+            #     collection_name=self.collection_name,
+            #     points=[
+            #         models.PointStruct(
+            #             id=node.node_id,
+            #             vector=vectors[i],
+            #             payload={
+            #                 "file_path": node.metadata.get("file_path"),
+            #                 "file_name": node.metadata.get("file_name"),
+            #                 "file_type": node.metadata.get("file_type"),
+            #                 "file_size": node.metadata.get("file_size"),
+            #             },
+            #         )
+            #         for i, node in enumerate(nodes_to_add)
+            #     ],
+            # )
+        if actions:
+            self.client.batch_update_points(
+                collection_name=self.collection_name, update_operations=actions
+            )
         self.client.update_collection(
             collection_name=self.collection_name,
             hnsw_config=models.HnswConfigDiff(m=16),
+        )
+        print(
+            "Qdrant collection info after:",
+            self.client.get_collection(collection_name=self.collection_name),
         )
 
     @staticmethod
@@ -931,6 +1109,10 @@ class QdrantStore(BaseSearchStore):
         node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]],
         size: int = 5,
     ) -> VectorStoreQueryResult:
+        print(
+            "Qdrant collection info:",
+            self.client.get_collection(collection_name=self.collection_name),
+        )
         results = self.client.query_points(
             collection_name=self.collection_name,
             query=self.embedding_model.get_text_embedding(query),
@@ -959,29 +1141,312 @@ class QdrantStore(BaseSearchStore):
             points=results.points, node_fetch_fn=node_fetch_fn
         )
 
+    def sync(
+        self,
+        ground_truth: set[str],
+        node_fetch_fn: Callable[[list[str]], dict[str, BaseNode]],
+    ) -> None:
+        qdrant_nodes: set[str] = set()
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.collection_name,
+                limit=1000,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            qdrant_nodes.update(str(point.id) for point in points)
+            if offset is None:
+                break
+        node_ids_to_delete = list(qdrant_nodes - ground_truth)
+        nodes_to_add = list(node_fetch_fn(list(ground_truth - qdrant_nodes)).values())
+        self.add_delete_nodes(
+            nodes_to_add=nodes_to_add, node_ids_to_delete=node_ids_to_delete
+        )
+        # self.client.update_collection(
+        #     collection_name=self.collection_name, hnsw_config=models.HnswConfigDiff(m=0)
+        # )
+        # actions: list[models.UpdateOperation] = []
+        # if node_ids_to_delete:
+        #     actions.append(
+        #         models.DeleteOperation(
+        #             delete=models.PointIdsList(points=[i for i in node_ids_to_delete])
+        #         )
+        #     )
+        #     # self.client.delete(
+        #     #     collection_name=self.collection_name,
+        #     #     points_selector=models.PointIdsList(
+        #     #         points=[i.node_id for i in nodes_to_delete]
+        #     #     ),
+        #     # )
+        # if nodes_to_add:
+        #     vectors = self.embedding_model.get_text_embedding_batch(
+        #         [i.get_content(metadata_mode=MetadataMode.EMBED) for i in nodes_to_add]
+        #     )
+        #     actions.append(
+        #         models.UpsertOperation(
+        #             upsert=models.PointsList(
+        #                 points=[
+        #                     models.PointStruct(
+        #                         id=node.node_id,
+        #                         vector=vectors[i],
+        #                         payload={
+        #                             "file_path": node.metadata.get("file_path"),
+        #                             "file_name": node.metadata.get("file_name"),
+        #                             "file_type": node.metadata.get("file_type"),
+        #                             "file_size": node.metadata.get("file_size"),
+        #                         },
+        #                     )
+        #                     for i, node in enumerate(nodes_to_add)
+        #                 ]
+        #             )
+        #         )
+        #     )
+        #     # self.client.upsert(
+        #     #     collection_name=self.collection_name,
+        #     #     points=[
+        #     #         models.PointStruct(
+        #     #             id=node.node_id,
+        #     #             vector=vectors[i],
+        #     #             payload={
+        #     #                 "file_path": node.metadata.get("file_path"),
+        #     #                 "file_name": node.metadata.get("file_name"),
+        #     #                 "file_type": node.metadata.get("file_type"),
+        #     #                 "file_size": node.metadata.get("file_size"),
+        #     #             },
+        #     #         )
+        #     #         for i, node in enumerate(nodes_to_add)
+        #     #     ],
+        #     # )
+        # if actions:
+        #     self.client.batch_update_points(
+        #         collection_name=self.collection_name, update_operations=actions
+        #     )
+        # self.client.update_collection(
+        #     collection_name=self.collection_name,
+        #     hnsw_config=models.HnswConfigDiff(m=16),
+        # )
 
-nodes = postprocess_ingestion_nodes(nodes=nodes)
 
-print(nodes[0].get_content(MetadataMode.NONE))
-print(nodes[0].metadata)
-print(nodes[0].hash)
-print(nodes[0].node_id)
-print(nodes[0].relationships)
+def ingest_docs(
+    docs: Sequence[Document],
+    docstore: BaseDocstore,
+    searchstores: Sequence[BaseSearchStore],
+) -> None:
+    pipe = IngestionPipeline(
+        transformations=[
+            MarkdownNodeParser(),
+            SentenceSplitter(chunk_size=100, chunk_overlap=50),
+        ]
+    )
+    nodes = pipe.run(documents=docs)
 
-# print('"' + nodes[0].get_content() + '"')
-# print('"' + nodes[1].get_content() + '"')
+    nodes = postprocess_ingestion_nodes(nodes=nodes)
+
+    nodes_diff = NodeDiff([], [])
+    print("about to put objects in docstore")
+    try:
+        nodes_diff = docstore.get_nodes_diff(nodes=nodes)
+        print("Nodes diff", len(nodes_diff))
+    except Exception as e:
+        print(e)
+    print("objects put in docstore")
+    print(f"Nodes diff add: {len(nodes_diff.nodes_add)}")
+    print(f"Nodes diff delete: {len(nodes_diff.node_ids_delete)}")
+
+    for store in searchstores:
+        print(type(store))
+        store.add_delete_nodes(
+            nodes_to_add=nodes_diff.nodes_add,
+            node_ids_to_delete=nodes_diff.node_ids_delete,
+        )
+
+
+class RagDir(BaseModel):
+    dir_name: str
+
+
+class RagFiles(BaseModel):
+    file_paths: str | list[str]
+
+
+@app.post("/ingest_docs_from_dir/")
+async def ingest_docs_from_dir(dir_name: RagDir):
+    docstore = MongoDocstore()
+    searchstores: list[BaseSearchStore] = [ElasticsearchStore(), QdrantStore()]
+    try:
+        fs = fsspec.filesystem("s3", endpoint_url="http://localhost:4566")
+        converter = DocumentConverter()
+        docs = get_docs_from_dir(dir_name=dir_name.dir_name, fs=fs, converter=converter)
+        ingest_docs(docs, docstore=docstore, searchstores=searchstores)
+        print("here i am")
+        return {"status": "Success"}
+    except Exception as e:
+        return {"status": "failed", "error": e}
+
+
+@app.post("/ingest_doc_from_file/")
+async def ingest_doc_from_file(file_path: RagFiles):
+    docstore = MongoDocstore()
+    searchstores: list[BaseSearchStore] = [ElasticsearchStore(), QdrantStore()]
+    fs = fsspec.filesystem("s3", endpoint_url="http://localhost:4566")
+    converter = DocumentConverter()
+    file_paths: list[str] = []
+    if isinstance(file_path.file_paths, str):
+        file_paths = [file_path.file_paths]
+    else:
+        file_paths = file_path.file_paths
+    docs = [
+        get_doc_from_fpath(file_path=f_path, fs=fs, converter=converter)
+        for f_path in file_paths
+    ]
+    ingest_docs(docs, docstore=docstore, searchstores=searchstores)
+    return {"status": "Success"}
+
+
+@app.get("/sync/")
+async def sync():
+    docstore = MongoDocstore()
+    searchstores: list[BaseSearchStore] = [ElasticsearchStore(), QdrantStore()]
+    all_node_ids = docstore.get_all_node_ids()
+    for store in searchstores:
+        store.sync(ground_truth=all_node_ids, node_fetch_fn=docstore.get_nodes)
+    return {"status": "Success"}
+
+
+# docs = get_docs_from_dir(dir_name="my-bucket/pdfs/")
 #
-node_dict = {
-    node.node_id: NodeWithScore(node=node, score=(i + 1) / len(nodes))
-    for i, node in enumerate(nodes)
-}
-
-post_processor = MergeConsecutiveNodesPostprocessor()
-
-processed_nodes = post_processor.postprocess_nodes(nodes=list(node_dict.values()))
+# pipe = IngestionPipeline(
+#     transformations=[
+#         MarkdownNodeParser(),
+#         SentenceSplitter(chunk_size=100, chunk_overlap=50),
+#     ]
+# )
+# nodes = pipe.run(documents=docs)
 #
-# print('"' + processed_nodes[0].node.get_content()[:1500] + '"')
-print(len(processed_nodes))
+# nodes = postprocess_ingestion_nodes(nodes=nodes)
+#
+# nodes_diff = docstore.get_nodes_diff(nodes=nodes)
+#
+# for store in searchstores:
+#     store.add_delete_nodes(
+#         nodes_to_add=nodes_diff["add_nodes"], nodes_to_delete=nodes_diff["delete_nodes"]
+#     )
+
+
+class SearchQuery(BaseModel):
+    query: str
+    fusion_type: Literal["reciprocal_rank_fusion", "rerank_model"] = (
+        "reciprocal_rank_fusion"
+    )
+    retriever_top_k: int = 10
+    final_top_k: int = 5
+
+
+@app.post("/query/")
+async def query(search_query: SearchQuery):
+    docstore = MongoDocstore()
+    searchstores: list[BaseSearchStore] = [ElasticsearchStore(), QdrantStore()]
+    postprocesors: list[BaseNodePostprocessor] = [
+        PrevNextNodePostprocessor(
+            id_node_fn=docstore.get_node, num_nodes=1, mode="both"
+        ),
+        MergeConsecutiveNodesPostprocessor(),
+    ]
+    query_results: list[VectorStoreQueryResult] = [
+        store.search_query(
+            query=search_query.query,
+            node_fetch_fn=docstore.get_nodes,
+            size=search_query.retriever_top_k,
+        )
+        for store in searchstores
+    ]
+    # print([len(res.nodes) for res in query_results])
+
+    list_list_nodes_with_score: list[list[NodeWithScore]] = []
+    for res in query_results:
+        if not res.nodes:
+            continue
+        # assert res.nodes
+        scores = []
+        if res.similarities is None:
+            scores = [None] * len(res.nodes)
+        else:
+            scores = res.similarities
+        nodes = res.nodes
+        list_list_nodes_with_score.append(
+            [
+                NodeWithScore(node=node, score=score)
+                for node, score in zip(nodes, scores)
+            ]
+        )
+    if not list_list_nodes_with_score:
+        return {"status": "Failed", "Error": "No Query Results returned"}
+    combined_nodes: list[NodeWithScore] = []
+    if search_query.fusion_type == "reciprocal_rank_fusion":
+        combined_nodes = reciprocal_rerank_fusion(results=list_list_nodes_with_score)
+    elif search_query.fusion_type == "rerank_model":
+        combined_nodes = rerank_nodes(
+            query=search_query.query,
+            nodes=dedup_nodes_with_score(list(chain(*list_list_nodes_with_score))),
+        )
+    postprocess_combined_nodes = reduce(
+        lambda v, p_processor: p_processor.postprocess_nodes(v),
+        postprocesors,
+        combined_nodes,
+    )
+    return {
+        "status": "Success",
+        "rag_texts": [
+            node.get_content(metadata_mode=MetadataMode.LLM)
+            for node in postprocess_combined_nodes
+        ],
+    }
+
+
+# fusion_nodes = reciprocal_rerank_fusion(list_list_nodes_with_score)
+#
+# reranked_nodes = rerank_nodes(
+#     query=query, nodes=dedup_nodes_with_score(list(chain(*list_list_nodes_with_score)))
+# )
+#
+# postprocesors: list[BaseNodePostprocessor] = [
+#     PrevNextNodePostprocessor(id_node_fn=docstore.get_node, num_nodes=1, mode="both"),
+#     MergeConsecutiveNodesPostprocessor(),
+# ]
+#
+# postprocess_fusion_nodes = reduce(
+#     lambda v, p_processor: p_processor.postprocess_nodes(v), postprocesors, fusion_nodes
+# )
+# postprocess_rerank_nodes = reduce(
+#     lambda v, p_processor: p_processor.postprocess_nodes(v),
+#     postprocesors,
+#     reranked_nodes,
+# )
+#
+#
+# post_processed_nodes: list[list[NodeWithScore]] = []
+#
+# for node_list in list_list_nodes_with_score:
+#     for postprocessor in postprocesors:
+#         post_processed_nodes.append(postprocessor.postprocess_nodes(nodes=node_list))
+#
+#
+# # print('"' + nodes[0].get_content() + '"')
+# # print('"' + nodes[1].get_content() + '"')
+# #
+# node_dict = {
+#     node.node_id: NodeWithScore(node=node, score=(i + 1) / len(nodes))
+#     for i, node in enumerate(nodes)
+# }
+#
+# post_processor = MergeConsecutiveNodesPostprocessor()
+#
+# processed_nodes = post_processor.postprocess_nodes(nodes=list(node_dict.values()))
+# #
+# # print('"' + processed_nodes[0].node.get_content()[:1500] + '"')
+# print(len(processed_nodes))
 # print('"' + node_dict[processed_nodes[0].node.node_id].get_content()[:1500] + '"')
 # # print('"' + processed_nodes[1].node.get_content() + '"')
 #

@@ -1,0 +1,9 @@
+fastapi[standard]
+fsspec[s3]
+docling
+llama-index-embeddings-openai-like
+filetype
+llama-index-core
+pymongo
+elasticsearch
+qdrant-client

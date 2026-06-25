@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-deploy
+  labels:
+    app: rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-pod
+  template:
+    metadata:
+      labels:
+        app: rag-pod
+    spec:
+      containers:
+      - name: rag-cont
+        image: fahim03/rag_service:latest
+        ports:
+        - containerPort: 8000
+        env:
+          - name: AWS_ENDPOINT_URL
+            value: http://flocci-service:4566
+          - name: AWS_DEFAULT_REGION
+            value: us-east-1
+          - name: AWS_ACCESS_KEY_ID
+            value: test
+          - name: AWS_SECRET_ACCESS_KEY
+            value: test
+          - name: MONGO_INITDB_ROOT_USERNAME
+            value: root
+          - name: MONGO_INITDB_ROOT_PASSWORD
+            value: example
+          - name: MONGO_SERVICE_HOSTNAME
+            value: mongo-service
+          - name: LLAMA_CPP_HOSTNAME
+            value: host.minikube.internal
+          - name: QDRANT_HOSTNAME
+            value: qdrant
+          - name: ES_URL
+            value: http://quickstart-es-http.default.svc:9200
+          - name: DOCLING_ARTIFACTS_PATH
+            value: /root/.cache/docling/models

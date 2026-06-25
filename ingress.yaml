@@ -25,13 +25,23 @@ spec:
                 name: bucket-service
                 port:
                   number: 8000
-    - host: code-runner
+    - host: rag
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: runcode-service
+                name: rag-service
                 port:
                   number: 8000
+    # - host: code-runner
+    #   http:
+    #     paths:
+    #       - path: /
+    #         pathType: Prefix
+    #         backend:
+    #           service:
+    #             name: runcode-service
+    #             port:
+    #               number: 8000

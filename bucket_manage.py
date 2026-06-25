@@ -1,7 +1,6 @@
 import os
 import shutil
 import tempfile
-import traceback
 import zipfile
 from typing import Annotated
 
@@ -29,18 +28,15 @@ def ensure_bucket(s3_client, bucket_name="my-bucket"):
 
 @app.get("/")
 async def check_bucket():
-    try:
-        s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
-        created_bool = ensure_bucket(s3_client=s3)
-        assert created_bool
-        return {"status": "success"}
-    except Exception:
-        return {"status": "failed", "exception": traceback.format_exc()}
+    s3 = boto3.client("s3", endpoint_url="http://localhost:4566")
+    created_bool = ensure_bucket(s3_client=s3)
+    assert created_bool
+    return {"status": "success"}
 
 
 @app.get("/upload_file_link/")
 async def get_post_link(file: str, userid: str, sessionid: str):
-    s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+    s3 = boto3.client("s3", endpoint_url="http://localhost:4566")
     url = s3.generate_presigned_post(
         "my-bucket",
         f"users/{userid}/{sessionid}/file_dir/{file}",
@@ -52,27 +48,9 @@ async def get_post_link(file: str, userid: str, sessionid: str):
     return {"status": "success", "url": url}
 
 
-@app.get("/upload_file_link_rag/")
-async def get_post_link_rag(file: str, dir_name: str | None = "pdfs/"):
-    s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
-    if dir_name:
-        dir_name = f'dir_name.strip("/")/{file}'
-    else:
-        dir_name = file
-    url = s3.generate_presigned_post(
-        "my-bucket",
-        dir_name,
-        Conditions=[
-            ["content-length-range", 0, 50 * 1024 * 1024]  # 0–50 MB
-        ],
-    )
-    print(url)
-    return {"status": "success", "url": url}
-
-
 @app.get("/download_file_link/")
 async def get_presigned_url(file: str, userid: str, sessionid: str):
-    s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+    s3 = boto3.client("s3", endpoint_url="http://localhost:4566")
     url = s3.generate_presigned_url(
         "get_object",
         Params={
@@ -91,7 +69,7 @@ async def upload_file(
 ):
     files_up = []
     try:
-        s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+        s3 = boto3.client("s3", endpoint_url="http://localhost:4566")
         created_bool = ensure_bucket(s3_client=s3)
         assert created_bool
         for file in files:
@@ -111,7 +89,7 @@ async def download_file(
     background_tasks: BackgroundTasks, files: list[str], userid: str, sessionid: str
 ):
     with tempfile.TemporaryDirectory(delete=False) as my_temp_dir:
-        s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+        s3 = boto3.client("s3", endpoint_url="http://localhost:4566")
         for file in files:
             s3.download_file(
                 "my-bucket",
