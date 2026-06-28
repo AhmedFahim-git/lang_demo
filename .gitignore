@@ -226,3 +226,5 @@ __marimo__/
 uv.lock
 
 pdfs/
+
+temp_work/
