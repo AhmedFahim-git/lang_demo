@@ -28,10 +28,14 @@ from a2a.types import (
     AgentInterface,
     AgentProvider,
     AgentSkill,
+    Message,
+    Part,
     Role,
     TaskState,
 )
 from fastapi import FastAPI
+from google.protobuf.json_format import MessageToDict, ParseDict
+from google.protobuf.struct_pb2 import Value
 
 
 class SampleAgent:
@@ -66,27 +70,55 @@ class SampleAgentExecutor(AgentExecutor):
         task_updater = TaskUpdater(
             event_queue=event_queue, task_id=task.id, context_id=task.context_id
         )
+        if task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED:
+            last_part = MessageToDict(context.message.parts[-1])
+            new_part = Part(data=ParseDict(last_part["data"], Value()))
+            update_message = Message(
+                role=Role.ROLE_AGENT,
+                context_id=task.context_id,
+                task_id=task.id,
+                parts=[
+                    new_part,
+                ],
+            )
+            # await task_updater.update_status(state=TaskState.TASK_STATE_WORKING, message=update_message)
+            await task_updater.start_work(message=update_message)
+            await task_updater.add_artifact(
+                parts=[new_text_part("Yo this is my message")]
+            )
+            await task_updater.complete(
+                new_text_message(text="Task Completed Successfully")
+            )
 
-        await task_updater.update_status(
-            state=TaskState.TASK_STATE_WORKING,
-            message=new_text_message("Start working on task", role=Role.ROLE_AGENT),
-        )
-
-        query = get_message_text(context.message)
-        if query:
-            result = await self.agent.invoke(query)
         else:
-            result = "No text input provided"
+            await task_updater.update_status(
+                state=TaskState.TASK_STATE_WORKING,
+                message=new_text_message("Start working on task", role=Role.ROLE_AGENT),
+            )
 
-        await task_updater.add_artifact(
-            parts=[new_text_part(text=result, media_type="text/plain")]
-        )
-        print("result:", result)
+            query = get_message_text(context.message)
+            if query:
+                result = await self.agent.invoke(query)
+            else:
+                result = "No text input provided"
 
-        await task_updater.update_status(
-            state=TaskState.TASK_STATE_COMPLETED,
-            message=new_text_message(text="Task Completed Successfully"),
-        )
+            await task_updater.add_artifact(
+                parts=[new_text_part(text=result, media_type="text/plain")]
+            )
+            print("result:", result)
+            await task_updater.requires_input(
+                message=new_text_message(
+                    text="Give me some input",
+                    role=Role.ROLE_AGENT,
+                    context_id=task.context_id,
+                    task_id=task.id,
+                )
+            )
+
+        # await task_updater.update_status(
+        #     state=TaskState.TASK_STATE_COMPLETED,
+        #     message=new_text_message(text="Task Completed Successfully"),
+        # )
         # await event_queue.enqueue_event(
         #     new_task_from_user_message(
         #         new_text_message("My Message", role=Role.ROLE_USER)
