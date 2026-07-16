@@ -1,5 +1,6 @@
 import time
 
+import httpx
 import uvicorn
 from a2a.helpers import (
     get_message_text,
@@ -15,13 +16,19 @@ from a2a.server.routes import (
     create_agent_card_routes,
     create_jsonrpc_routes,
 )
-from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.server.tasks import (
+    BasePushNotificationSender,
+    InMemoryPushNotificationConfigStore,
+    InMemoryTaskStore,
+    TaskUpdater,
+)
 from a2a.types import (
     AgentCapabilities,
     AgentCard,
     AgentInterface,
     AgentProvider,
     AgentSkill,
+    Role,
     TaskState,
 )
 from fastapi import FastAPI
@@ -62,7 +69,7 @@ class SampleAgentExecutor(AgentExecutor):
 
         await task_updater.update_status(
             state=TaskState.TASK_STATE_WORKING,
-            message=new_text_message("Start working on task"),
+            message=new_text_message("Start working on task", role=Role.ROLE_AGENT),
         )
 
         query = get_message_text(context.message)
@@ -123,11 +130,18 @@ if __name__ == "__main__":
         default_output_modes=["text/plain"],
         skills=[skill],
     )
+    httpx_client = httpx.AsyncClient()
+    push_config_store = InMemoryPushNotificationConfigStore()
+    push_sender = BasePushNotificationSender(
+        httpx_client=httpx_client, config_store=push_config_store
+    )
 
     request_handler = DefaultRequestHandler(
         agent_executor=SampleAgentExecutor(),
         task_store=InMemoryTaskStore(),
         agent_card=agent_card,
+        push_config_store=push_config_store,
+        push_sender=push_sender,
     )
 
     add_a2a_routes_to_fastapi(
