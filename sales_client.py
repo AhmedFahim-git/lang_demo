@@ -14,7 +14,7 @@ async def display_message(message: Any) -> None:
 
 
 def parse_sse(text: str) -> dict[str, Any]:
-    items: dict[str, Any] = dict()
+    items: dict[str, Any] = {}
     for line in text.strip().splitlines():
         k, v = line.split(sep=":", maxsplit=1)
         items[k] = v.strip()
@@ -71,30 +71,30 @@ async def process_human_input_request(input_request: dict[str, Any]):
 
 
 async def send_message(user_input: dict[str, Any]):
-    async with asyncio.TaskGroup() as tg:
-        async with httpx.AsyncClient(timeout=10) as client:
-            async with client.stream(
-                method="POST", url="http://localhost:8000", json=user_input
-            ) as stream_res:
-                stream_res.raise_for_status()
-                async for text in stream_res.aiter_text():
-                    items = parse_sse(text)
-                    data: dict[str, Any] = items["data"]
-                    if data["type"] == "message":
-                        assert isinstance(data["content"], list)
-                        for item in data["content"]:
-                            if item["type"] == "refusal":
-                                await display_message(item["refusal"])
-                            if item["type"] == "output_text":
-                                await display_message(item["text"])
-                    elif data["type"] == "input_file":
-                        await display_message(data["file_url"])
-                    elif data["type"] == "human_input_required":
-                        tg.create_task(process_human_input_request(data))
+    async with asyncio.TaskGroup() as tg, httpx.AsyncClient(timeout=10) as client:
+        async with client.stream(
+            method="POST", url="http://localhost:8000", json=user_input
+        ) as stream_res:
+            stream_res.raise_for_status()
+            async for text in stream_res.aiter_text():
+                items = parse_sse(text)
+                data: dict[str, Any] = items["data"]
+                if data["type"] == "message":
+                    assert isinstance(data["content"], list)
+                    for item in data["content"]:
+                        if item["type"] == "refusal":
+                            await display_message(item["refusal"])
+                        if item["type"] == "output_text":
+                            await display_message(item["text"])
+                elif data["type"] == "input_file":
+                    await display_message(data["file_url"])
+                elif data["type"] == "human_input_required":
+                    tg.create_task(process_human_input_request(data))
 
 
 async def main():
     while True:
+        # What is weather in Amsterdam? What is the current UTC time
         user_input = await get_input("User Input: ")
         if user_input == "exit":
             break
