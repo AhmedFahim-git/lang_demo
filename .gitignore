@@ -228,3 +228,7 @@ uv.lock
 pdfs/
 
 temp_work/
+
+
+# Sqlite database
+*.db
