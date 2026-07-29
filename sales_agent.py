@@ -5,11 +5,11 @@ from collections.abc import AsyncIterable, Awaitable, Callable
 from datetime import UTC, datetime
 from enum import Enum
 from inspect import signature
-from typing import Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 from annotated_types import Ge, Gt, Le, Lt, MaxLen, MinLen, MultipleOf
 from browser_use import Agent, Browser, ChatOpenAI
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from openai import AsyncOpenAI, pydantic_function_tool
 from openai.types.responses import (
@@ -32,8 +32,170 @@ from openai.types.responses.response_input_param import FunctionCallOutput
 from pydantic import BaseModel, Field, Strict, create_model
 from pydantic.fields import FieldInfo
 from pydantic.json_schema import SkipJsonSchema
+from sqlalchemy import select
+from sqlalchemy.orm import (
+    Session,
+)
+
+from .database import (
+    HumanUserModel,
+    UserModel,
+    get_db_session,
+)
 
 client = AsyncOpenAI(api_key="None", base_url="http://localhost:8080/v1")
+
+
+# class Base(DeclarativeBase):
+#     pass
+
+
+# Made during signup not login
+# class HumanUserModel(Base):
+#     __tablename__ = "human_users"
+#
+#     human_user_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+#     username: Mapped[str] = mapped_column(
+#         String(length=50), unique=True, nullable=False
+#     )
+#     fullname: Mapped[str] = mapped_column(String(length=50), nullable=False)
+#     email: Mapped[str] = mapped_column(String(length=50), unique=True, nullable=False)
+#     user_id: Mapped[int] = mapped_column(
+#         ForeignKey("users.user_id"), nullable=False, unique=True
+#     )
+#
+#     user: Mapped["UserModel"] = relationship(back_populates="human_user")
+#
+#
+# class AgentUserModel(Base):
+#     __tablename__ = "agent_users"
+#
+#     agent_user_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+#     agent_name: Mapped[str] = mapped_column(String(length=50), nullable=False)
+#     agent_description: Mapped[str] = mapped_column(Text, nullable=False)
+#     system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+#     tools_list: Mapped[str] = mapped_column(
+#         Text
+#     )  # Comma separated list of tool names (can be more sophisticated later on)
+#     user_id: Mapped[int] = mapped_column(
+#         ForeignKey("users.user_id"), nullable=False, unique=True
+#     )
+#
+#     user: Mapped["UserModel"] = relationship(back_populates="agent_user")
+#
+#
+# class UserModel(Base):
+#     __tablename__ = "users"
+#
+#     user_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+#     is_human: Mapped[bool] = mapped_column(Boolean, default=True)
+#
+#     human_user: Mapped["HumanUserModel"] = relationship(
+#         back_populates="user", foreign_keys=[HumanUserModel.user_id]
+#     )
+#     agent_user: Mapped["AgentUserModel"] = relationship(
+#         back_populates="user", foreign_keys=[AgentUserModel.user_id]
+#     )
+#     sessions: Mapped[list["SessionModel"]] = relationship(back_populates="user")
+#
+#
+# class MessageModel(Base):
+#     __tablename__ = "messages"
+#
+#     message_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+#     session_id: Mapped[int] = mapped_column(
+#         ForeignKey("sessions.session_id"), nullable=False, index=True
+#     )
+#     parent_session_id: Mapped[int] = mapped_column(
+#         ForeignKey("sessions.session_id"), nullable=True
+#     )
+#     content: Mapped[str] = mapped_column(Text, nullable=False)
+#     message_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+#
+#     session: Mapped["SessionModel"] = relationship(
+#         back_populates="messages", foreign_keys=[session_id]
+#     )
+#     parent_session: Mapped["SessionModel"] = relationship(
+#         back_populates="messages_as_parent", foreign_keys=[parent_session_id]
+#     )
+#
+#     def __repr__(self):
+#         return f"Message_id: {self.message_id}, content: {self.content}, session_id: {self.session_id}, message_time: {self.message_time}"
+#
+#
+# class SessionModel(Base):
+#     __tablename__ = "sessions"
+#
+#     session_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+#     user_id: Mapped[int] = mapped_column(
+#         ForeignKey("users.user_id"), nullable=False, index=True
+#     )
+#
+#     user: Mapped["UserModel"] = relationship(back_populates="sessions")
+#     messages: Mapped[list["MessageModel"]] = relationship(
+#         back_populates="session", foreign_keys=[MessageModel.session_id]
+#     )
+#     messages_as_parent: Mapped[list["MessageModel"]] = relationship(
+#         back_populates="parent_session", foreign_keys=[MessageModel.parent_session_id]
+#     )
+
+
+# DB_URL = "sqlite:///:memory:"
+# db_engine = create_engine(url=DB_URL, connect_args={"check_same_thread": False})
+#
+# Base.metadata.create_all(db_engine)
+#
+# SessionLocal = sessionmaker(bind=db_engine)
+#
+#
+# def get_db_session():
+#     with SessionLocal() as db_session:
+#         yield db_session
+#
+
+# with SessionLocal() as db_session:
+#     human_user = HumanUserModel(
+#         fullname="My Boy", email="wassup@yo.com", user=UserModel(username="boyo")
+#     )
+#     agent_user = AgentUserModel(
+#         agent_name="my_agent",
+#         agent_description="My agent description",
+#         system_prompt="You are a helpful agent",
+#         tools_list="Some_tool, some_other_tool",
+#         user=UserModel(username="some_name"),
+#     )
+#     human_session = SessionModel(user=human_user.user)
+#     messages = [
+#         MessageModel(
+#             content=f"Message number {i}",
+#             session=human_session,
+#             message_time=datetime.now(UTC),
+#         )
+#         for i in range(5)
+#     ]
+#     db_session.add_all([human_user, agent_user, human_session] + messages)
+#     print(messages[0].message_time)
+#     # sleep(2)
+#     # messages.append(MessageModel(content="Inside message", session=human_session))
+#     db_session.commit()
+#     print(human_session.session_id)
+
+# with SessionLocal() as db_session:
+#     stmt = select(SessionModel).where(SessionModel.session_id == 1)
+#     req_session = db_session.scalars(stmt).one()
+#     req_session.messages.append(
+#         MessageModel(content="Outside Message", message_time=datetime.now(UTC))
+#     )
+#     sleep(2)
+#     req_session.messages.append(
+#         MessageModel(content="Outside Message 2", message_time=datetime.now(UTC))
+#     )
+#     db_session.commit()
+
+# with SessionLocal() as db_session:
+#     stmt = select(MessageModel).where(MessageModel.session_id == 1)
+#     for message in db_session.scalars(stmt):
+#         print(message)
 
 
 class FuncCallStatus(str, Enum):
@@ -319,6 +481,13 @@ async def run_tool_call(
     return res_list
 
 
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     Base.metadata.create_all(db_engine)
+#     print("whoa")
+#     yield
+
+
 app = FastAPI()
 
 
@@ -369,6 +538,50 @@ async def run_model_loop(
             break
         tool_calls = []
     print(f"Out of loop: {input_list}")
+
+
+class UserCreate(BaseModel):
+    username: str
+    fullname: str
+    email: str
+
+
+class UserResponse(BaseModel):
+    username: str
+    user_id: int
+
+
+# with SessionLocal() as db_session:
+#     stmt = select(HumanUserModel).where(HumanUserModel.username == "my_username")
+#     prev_user = db_session.scalars(stmt).first()
+#     if prev_user:
+#         raise HTTPException(
+#             status_code=status.HTTP_409_CONFLICT, detail="User already exists"
+#         )
+
+
+@app.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def signup(
+    user_details: UserCreate, db_session: Annotated[Session, Depends(get_db_session)]
+):
+    # Base.metadata.create_all(db_engine)
+    stmt = select(HumanUserModel).where(
+        HumanUserModel.username == user_details.username
+    )
+    prev_user = db_session.scalars(stmt).first()
+    if prev_user:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="User already exists"
+        )
+    new_user = HumanUserModel(
+        username=user_details.username,
+        fullname=user_details.fullname,
+        email=user_details.email,
+        user=UserModel(),
+    )
+    db_session.add(new_user)
+    db_session.commit()
+    return UserResponse(username=new_user.username, user_id=new_user.user_id)
 
 
 # Need to break up this function and remove print statements

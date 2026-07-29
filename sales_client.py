@@ -93,18 +93,29 @@ async def send_message(user_input: dict[str, Any]):
 
 
 async def main():
-    while True:
-        # What is weather in Amsterdam? What is the current UTC time
-        user_input = await get_input("User Input: ")
-        if user_input == "exit":
-            break
-        await send_message(
-            {
-                "role": "user",
-                "type": "message",
-                "content": [{"type": "input_text", "text": user_input}],
+    async with httpx.AsyncClient() as client:
+        result = await client.post(
+            "http://localhost:8000/signup",
+            json={
+                "username": "my_user",
+                "fullname": "Edward Elric",
+                "email": "sth@yo.com",
             },
         )
+        print(result.status_code)
+        print(result.json())
+    # while True:
+    #     # What is weather in Amsterdam? What is the current UTC time
+    #     user_input = await get_input("User Input: ")
+    #     if user_input == "exit":
+    #         break
+    #     await send_message(
+    #         {
+    #             "role": "user",
+    #             "type": "message",
+    #             "content": [{"type": "input_text", "text": user_input}],
+    #         },
+    #     )
 
 
 if __name__ == "__main__":
