@@ -23,7 +23,9 @@ def parse_sse(text: str) -> dict[str, Any]:
     return items
 
 
-async def process_human_input_request(input_request: dict[str, Any]):
+async def process_human_input_request(
+    input_request: dict[str, Any], user_id: int, session_id: int | None = None
+):
     tool_call_param, tool_call_output = (
         input_request["tool_call_param"],
         input_request["tool_call_output"],
@@ -54,7 +56,8 @@ async def process_human_input_request(input_request: dict[str, Any]):
         try:
             human_input = await get_input(
                 "Provide Requested information in json format: "
-            )
+            )  # It should be {"feedback":"some feedback"}
+            # human_input = '{"feedback": "some feedback"}'
             human_json: dict[str, Any] = json.loads(human_input)
             assert all(field in human_json for field in required_fields)
             await send_message(
@@ -64,32 +67,51 @@ async def process_human_input_request(input_request: dict[str, Any]):
                     "tool_call_output": tool_call_output,
                     "human_input": human_json,
                 },
+                user_id=user_id,
+                session_id=session_id,
             )
             break
         except Exception as e:
             await display_message(str(e))
 
 
-async def send_message(user_input: dict[str, Any]):
-    async with asyncio.TaskGroup() as tg, httpx.AsyncClient(timeout=10) as client:
-        async with client.stream(
-            method="POST", url="http://localhost:8000", json=user_input
-        ) as stream_res:
-            stream_res.raise_for_status()
-            async for text in stream_res.aiter_text():
-                items = parse_sse(text)
-                data: dict[str, Any] = items["data"]
-                if data["type"] == "message":
-                    assert isinstance(data["content"], list)
-                    for item in data["content"]:
-                        if item["type"] == "refusal":
-                            await display_message(item["refusal"])
-                        if item["type"] == "output_text":
-                            await display_message(item["text"])
-                elif data["type"] == "input_file":
-                    await display_message(data["file_url"])
-                elif data["type"] == "human_input_required":
-                    tg.create_task(process_human_input_request(data))
+async def send_message(
+    user_input: dict[str, Any], user_id: int, session_id: int | None = None
+):
+    header = {"user-id": str(user_id)}
+    if session_id is not None:
+        header["session-id"] = str(session_id)
+    async with (
+        asyncio.TaskGroup() as tg,
+        httpx.AsyncClient() as client,
+        client.stream(
+            method="POST",
+            url="http://localhost:8000",
+            json=user_input,
+            headers=header,
+        ) as stream_res,
+    ):
+        stream_res.raise_for_status()
+        async for text in stream_res.aiter_text():
+            items = parse_sse(text)
+            data: dict[str, Any] = items["data"]
+            if data["type"] == "session_init":
+                session_id: int = data["session_id"]
+            elif data["type"] == "message":
+                assert isinstance(data["content"], list)
+                for item in data["content"]:
+                    if item["type"] == "refusal":
+                        await display_message(item["refusal"])
+                    if item["type"] == "output_text":
+                        await display_message(item["text"])
+            elif data["type"] == "input_file":
+                await display_message(data["file_url"])
+            elif data["type"] == "human_input_required":
+                tg.create_task(
+                    process_human_input_request(
+                        data, user_id=user_id, session_id=session_id
+                    )
+                )
 
 
 async def main():
@@ -104,18 +126,20 @@ async def main():
         )
         print(result.status_code)
         print(result.json())
-    # while True:
-    #     # What is weather in Amsterdam? What is the current UTC time
-    #     user_input = await get_input("User Input: ")
-    #     if user_input == "exit":
-    #         break
-    #     await send_message(
-    #         {
-    #             "role": "user",
-    #             "type": "message",
-    #             "content": [{"type": "input_text", "text": user_input}],
-    #         },
-    #     )
+        user_id: int = result.json().get("user_id")
+    while True:
+        # What is weather in Amsterdam? What is the current UTC time
+        user_input = await get_input("User Input: ")
+        if user_input == "exit":
+            break
+        await send_message(
+            {
+                "role": "user",
+                "type": "message",
+                "content": [{"type": "input_text", "text": user_input}],
+            },
+            user_id=user_id,
+        )
 
 
 if __name__ == "__main__":

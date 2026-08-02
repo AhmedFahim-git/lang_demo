@@ -1,24 +1,25 @@
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterable, Awaitable, Callable
+from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from enum import Enum
+from functools import partial
 from inspect import signature
 from typing import Annotated, Any, Literal, TypedDict
 
 from annotated_types import Ge, Gt, Le, Lt, MaxLen, MinLen, MultipleOf
 from browser_use import Agent, Browser, ChatOpenAI
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from openai import AsyncOpenAI, pydantic_function_tool
 from openai.types.responses import (
     EasyInputMessage,
-    EasyInputMessageParam,
     FunctionToolParam,
     ResponseFunctionToolCall,
     ResponseFunctionToolCallOutputItem,
     ResponseFunctionToolCallParam,
+    ResponseInputItemParam,
     ResponseInputParam,
     ResponseInputText,
     ResponseOutputItem,
@@ -39,6 +40,8 @@ from sqlalchemy.orm import (
 
 from .database import (
     HumanUserModel,
+    MessageModel,
+    SessionModel,
     UserModel,
     get_db_session,
 )
@@ -46,156 +49,18 @@ from .database import (
 client = AsyncOpenAI(api_key="None", base_url="http://localhost:8080/v1")
 
 
-# class Base(DeclarativeBase):
-#     pass
-
-
-# Made during signup not login
-# class HumanUserModel(Base):
-#     __tablename__ = "human_users"
-#
-#     human_user_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-#     username: Mapped[str] = mapped_column(
-#         String(length=50), unique=True, nullable=False
-#     )
-#     fullname: Mapped[str] = mapped_column(String(length=50), nullable=False)
-#     email: Mapped[str] = mapped_column(String(length=50), unique=True, nullable=False)
-#     user_id: Mapped[int] = mapped_column(
-#         ForeignKey("users.user_id"), nullable=False, unique=True
-#     )
-#
-#     user: Mapped["UserModel"] = relationship(back_populates="human_user")
-#
-#
-# class AgentUserModel(Base):
-#     __tablename__ = "agent_users"
-#
-#     agent_user_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-#     agent_name: Mapped[str] = mapped_column(String(length=50), nullable=False)
-#     agent_description: Mapped[str] = mapped_column(Text, nullable=False)
-#     system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
-#     tools_list: Mapped[str] = mapped_column(
-#         Text
-#     )  # Comma separated list of tool names (can be more sophisticated later on)
-#     user_id: Mapped[int] = mapped_column(
-#         ForeignKey("users.user_id"), nullable=False, unique=True
-#     )
-#
-#     user: Mapped["UserModel"] = relationship(back_populates="agent_user")
-#
-#
-# class UserModel(Base):
-#     __tablename__ = "users"
-#
-#     user_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-#     is_human: Mapped[bool] = mapped_column(Boolean, default=True)
-#
-#     human_user: Mapped["HumanUserModel"] = relationship(
-#         back_populates="user", foreign_keys=[HumanUserModel.user_id]
-#     )
-#     agent_user: Mapped["AgentUserModel"] = relationship(
-#         back_populates="user", foreign_keys=[AgentUserModel.user_id]
-#     )
-#     sessions: Mapped[list["SessionModel"]] = relationship(back_populates="user")
-#
-#
-# class MessageModel(Base):
-#     __tablename__ = "messages"
-#
-#     message_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-#     session_id: Mapped[int] = mapped_column(
-#         ForeignKey("sessions.session_id"), nullable=False, index=True
-#     )
-#     parent_session_id: Mapped[int] = mapped_column(
-#         ForeignKey("sessions.session_id"), nullable=True
-#     )
-#     content: Mapped[str] = mapped_column(Text, nullable=False)
-#     message_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-#
-#     session: Mapped["SessionModel"] = relationship(
-#         back_populates="messages", foreign_keys=[session_id]
-#     )
-#     parent_session: Mapped["SessionModel"] = relationship(
-#         back_populates="messages_as_parent", foreign_keys=[parent_session_id]
-#     )
-#
-#     def __repr__(self):
-#         return f"Message_id: {self.message_id}, content: {self.content}, session_id: {self.session_id}, message_time: {self.message_time}"
-#
-#
-# class SessionModel(Base):
-#     __tablename__ = "sessions"
-#
-#     session_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-#     user_id: Mapped[int] = mapped_column(
-#         ForeignKey("users.user_id"), nullable=False, index=True
-#     )
-#
-#     user: Mapped["UserModel"] = relationship(back_populates="sessions")
-#     messages: Mapped[list["MessageModel"]] = relationship(
-#         back_populates="session", foreign_keys=[MessageModel.session_id]
-#     )
-#     messages_as_parent: Mapped[list["MessageModel"]] = relationship(
-#         back_populates="parent_session", foreign_keys=[MessageModel.parent_session_id]
-#     )
-
-
-# DB_URL = "sqlite:///:memory:"
-# db_engine = create_engine(url=DB_URL, connect_args={"check_same_thread": False})
-#
-# Base.metadata.create_all(db_engine)
-#
-# SessionLocal = sessionmaker(bind=db_engine)
-#
-#
-# def get_db_session():
-#     with SessionLocal() as db_session:
-#         yield db_session
-#
-
-# with SessionLocal() as db_session:
-#     human_user = HumanUserModel(
-#         fullname="My Boy", email="wassup@yo.com", user=UserModel(username="boyo")
-#     )
-#     agent_user = AgentUserModel(
-#         agent_name="my_agent",
-#         agent_description="My agent description",
-#         system_prompt="You are a helpful agent",
-#         tools_list="Some_tool, some_other_tool",
-#         user=UserModel(username="some_name"),
-#     )
-#     human_session = SessionModel(user=human_user.user)
-#     messages = [
-#         MessageModel(
-#             content=f"Message number {i}",
-#             session=human_session,
-#             message_time=datetime.now(UTC),
-#         )
-#         for i in range(5)
-#     ]
-#     db_session.add_all([human_user, agent_user, human_session] + messages)
-#     print(messages[0].message_time)
-#     # sleep(2)
-#     # messages.append(MessageModel(content="Inside message", session=human_session))
-#     db_session.commit()
-#     print(human_session.session_id)
-
-# with SessionLocal() as db_session:
-#     stmt = select(SessionModel).where(SessionModel.session_id == 1)
-#     req_session = db_session.scalars(stmt).one()
-#     req_session.messages.append(
-#         MessageModel(content="Outside Message", message_time=datetime.now(UTC))
-#     )
-#     sleep(2)
-#     req_session.messages.append(
-#         MessageModel(content="Outside Message 2", message_time=datetime.now(UTC))
-#     )
-#     db_session.commit()
-
-# with SessionLocal() as db_session:
-#     stmt = select(MessageModel).where(MessageModel.session_id == 1)
-#     for message in db_session.scalars(stmt):
-#         print(message)
+class BaseHeaders:
+    def __init__(
+        self,
+        user_id: Annotated[int | None, Header()],
+        agent_id: Annotated[int | None, Header()] = None,
+        session_id: Annotated[int | None, Header()] = None,
+        parent_session_id: Annotated[int | None, Header()] = None,
+    ):
+        self.user_id = user_id
+        self.agent_id = agent_id
+        self.session_id = session_id
+        self.parent_session_id = parent_session_id
 
 
 class FuncCallStatus(str, Enum):
@@ -417,24 +282,19 @@ tools_json_list, tools_dict = get_tool_list_dict(
     tools=[use_browser, get_weather, get_time]
 )
 
-# input_list: ResponseInputParam = [
-#     EasyInputMessageParam(
-#         content="What is weather in Amsterdam? What is the current UTC time",
-#         role="user",
-#     )
-# ]
-
 
 def append_output(
-    response_output: list[ResponseOutputItem], input_list: ResponseInputParam
+    response_output: list[ResponseOutputItem],
+    update_func: Callable[[ResponseInputItemParam | HumanInputFromUser], None],
 ) -> None:
     for item in response_output:
         if item.type == "reasoning":
-            input_list.append(ResponseReasoningItemParam(item.model_dump()))
+            item_param = ResponseReasoningItemParam(item.model_dump())
         elif item.type == "message":
-            input_list.append(ResponseOutputMessageParam(item.model_dump()))
+            item_param = ResponseOutputMessageParam(item.model_dump())
         elif item.type == "function_call":
-            input_list.append(ResponseFunctionToolCallParam(item.model_dump()))
+            item_param = ResponseFunctionToolCallParam(item.model_dump())
+        update_func(item_param)
 
 
 async def process_tool_call(
@@ -455,7 +315,7 @@ async def process_tool_call(
 async def run_tool_call(
     tool_call: ResponseFunctionToolCall,
     tools_dict: dict[str, Callable[..., Awaitable[ToolOutput]]],
-    input_list: ResponseInputParam,
+    update_func: Callable[[ResponseInputItemParam | HumanInputFromUser], None],
     pending_call_ids: set[str],
 ) -> list[ServerSentEvent]:
     res = await process_tool_call(tool_call=tool_call, tool=tools_dict[tool_call.name])
@@ -465,9 +325,7 @@ async def run_tool_call(
     for item in call_output:
         if item.type == "input_file":
             res_list.append(ServerSentEvent(data=item))
-    if res.status == "completed":
-        input_list.append(FunctionCallOutput(res.model_dump()))
-    elif res.status == "in_progress":
+    if res.status == "in_progress":
         pending_call_ids.add(tool_call.call_id)
         res_list.append(
             ServerSentEvent(
@@ -478,25 +336,17 @@ async def run_tool_call(
                 )
             )
         )
+    update_func(FunctionCallOutput(res.model_dump()))
     return res_list
-
-
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     Base.metadata.create_all(db_engine)
-#     print("whoa")
-#     yield
 
 
 app = FastAPI()
 
 
-input_list: ResponseInputParam = []
-pending_call_ids: set[str] = set()
-
-
 async def run_model_loop(
-    input_list: ResponseInputParam, pending_call_ids: set[str]
+    input_list: ResponseInputParam,
+    pending_call_ids: set[str],
+    update_func: Callable[[ResponseInputItemParam | HumanInputFromUser], None],
 ) -> AsyncIterable[ServerSentEvent]:
     if pending_call_ids:
         raise HTTPException(
@@ -510,7 +360,7 @@ async def run_model_loop(
             tools=tools_json_list,
             input=input_list,
         )
-        append_output(response_output=response.output, input_list=input_list)
+        append_output(response_output=response.output, update_func=update_func)
         for item in response.output:
             if item.type == "function_call":
                 tool_calls.append(item)
@@ -524,7 +374,7 @@ async def run_model_loop(
                 run_tool_call(
                     tool_call=tool_call,
                     tools_dict=tools_dict,
-                    input_list=input_list,
+                    update_func=update_func,
                     pending_call_ids=pending_call_ids,
                 )
             )
@@ -551,15 +401,6 @@ class UserResponse(BaseModel):
     user_id: int
 
 
-# with SessionLocal() as db_session:
-#     stmt = select(HumanUserModel).where(HumanUserModel.username == "my_username")
-#     prev_user = db_session.scalars(stmt).first()
-#     if prev_user:
-#         raise HTTPException(
-#             status_code=status.HTTP_409_CONFLICT, detail="User already exists"
-#         )
-
-
 @app.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def signup(
     user_details: UserCreate, db_session: Annotated[Session, Depends(get_db_session)]
@@ -584,11 +425,92 @@ def signup(
     return UserResponse(username=new_user.username, user_id=new_user.user_id)
 
 
+allowed_items = {"reasoning", "message", "function_call", "function_call_output"}
+
+
+def messages_to_input_list(
+    message_list: Sequence[MessageModel],
+) -> tuple[ResponseInputParam, set[str]]:
+    input_list = []
+    pending_call_ids = set()
+    for message in message_list:
+        message_dict = json.loads(message.content)
+        if message_dict.get("type") in allowed_items:
+            if message_dict.get("type") == "function_call":
+                pending_call_ids.add(message_dict.get("call_id"))
+            elif message_dict.get("type") == "function_call_output":
+                if message_dict.get("status") == "completed":
+                    pending_call_ids.remove(message_dict.get("call_id"))
+                else:
+                    continue
+
+        input_list.append(message_dict)
+    return input_list, pending_call_ids
+
+
+def message_update_input_list_db(
+    item: ResponseInputItemParam | HumanInputFromUser,
+    input_list: ResponseInputParam,
+    base_headers: BaseHeaders,
+    db_session: Session,
+) -> None:
+    if isinstance(item, HumanInputFromUser):
+        db_session.add(
+            MessageModel(
+                session_id=base_headers.session_id,
+                parent_session_id=base_headers.parent_session_id,
+                content=item.model_dump_json(),
+                message_time=datetime.now(UTC),
+            )
+        )
+    else:
+        db_session.add(
+            MessageModel(
+                session_id=base_headers.session_id,
+                parent_session_id=base_headers.parent_session_id,
+                content=json.dumps(item),
+                message_time=datetime.now(UTC),
+            )
+        )
+    if (isinstance(item, dict)) and (item.get("type") in allowed_items):
+        if (item.get("type") == "function_call_output") and (
+            item.get("status") != "completed"
+        ):
+            return
+        input_list.append(item)
+
+
 # Need to break up this function and remove print statements
 @app.post("/", response_class=EventSourceResponse)
 async def run_model(
     model_input: EasyInputMessage | HumanInputFromUser,
+    db_session: Annotated[Session, Depends(get_db_session)],
+    base_headers: Annotated[BaseHeaders, Depends()],
 ) -> AsyncIterable[ServerSentEvent]:
+    print("wassup")
+    if base_headers.session_id is None:
+        session = SessionModel(user_id=base_headers.user_id)
+        db_session.add(session)
+        db_session.commit()
+        base_headers.session_id = session.session_id
+        yield ServerSentEvent(
+            data={"type": "session_init", "session_id": session.session_id}
+        )
+        message_list = []
+    else:
+        stmt = (
+            select(MessageModel)
+            .where(MessageModel.session_id == base_headers.session_id)
+            .order_by(MessageModel.message_time)
+        )
+        message_list = db_session.scalars(stmt).fetchall()
+    input_list, pending_call_ids = messages_to_input_list(message_list)
+    input_list_db_update_func = partial(
+        message_update_input_list_db,
+        input_list=input_list,
+        base_headers=base_headers,
+        db_session=db_session,
+    )
     print(model_input)
     if isinstance(model_input, EasyInputMessage):
         if pending_call_ids:
@@ -596,11 +518,13 @@ async def run_model(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="We should not be getting input while tool call human input is pending",
             )
-        input_list.append(EasyInputMessageParam(model_input.model_dump()))
+        input_list_db_update_func(model_input.model_dump())
         print(input_list)
         # Pending_call_ids is modified in place
         async for sse_event in run_model_loop(
-            input_list=input_list, pending_call_ids=pending_call_ids
+            input_list=input_list,
+            pending_call_ids=pending_call_ids,
+            update_func=input_list_db_update_func,
         ):
             yield sse_event
     elif isinstance(model_input, HumanInputFromUser):
@@ -624,7 +548,7 @@ async def run_model(
             for sse_event in await run_tool_call(
                 tool_call=model_input.tool_call_param,
                 tools_dict=tools_dict,
-                input_list=input_list,
+                update_func=input_list_db_update_func,
                 pending_call_ids=pending_call_ids,
             ):
                 yield sse_event
@@ -633,6 +557,9 @@ async def run_model(
             print(e)
         if not pending_call_ids:
             async for sse_event in run_model_loop(
-                input_list=input_list, pending_call_ids=pending_call_ids
+                input_list=input_list,
+                pending_call_ids=pending_call_ids,
+                update_func=input_list_db_update_func,
             ):
                 yield sse_event
+    db_session.commit()
