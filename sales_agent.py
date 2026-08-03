@@ -2,15 +2,17 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from functools import partial
 from inspect import signature
 from typing import Annotated, Any, Literal, TypedDict
 
+import jwt
 from annotated_types import Ge, Gt, Le, Lt, MaxLen, MinLen, MultipleOf
 from browser_use import Agent, Browser, ChatOpenAI
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from openai import AsyncOpenAI, pydantic_function_tool
 from openai.types.responses import (
@@ -30,6 +32,7 @@ from openai.types.responses.response_custom_tool_call_output import (
     OutputOutputContentList,
 )
 from openai.types.responses.response_input_param import FunctionCallOutput
+from pwdlib import PasswordHash
 from pydantic import BaseModel, Field, Strict, create_model
 from pydantic.fields import FieldInfo
 from pydantic.json_schema import SkipJsonSchema
@@ -48,16 +51,92 @@ from .database import (
 
 client = AsyncOpenAI(api_key="None", base_url="http://localhost:8080/v1")
 
+# Generated using "openssl rand -hex 32". Move this to a .env
+SECRET_KEY = "bd121e4ec165595a80f1cd5da97e80318fe0c0484c24739697c037aab9bd04a2"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+password_hash = PasswordHash.recommended()
+
+
+DUMMY_HASH = password_hash.hash("dummypassword")
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+
+def get_user(db_session: Session, username: str) -> HumanUserModel | None:
+    stmt = select(HumanUserModel).where(HumanUserModel.username == username)
+    user = db_session.scalars(stmt).one_or_none()
+    if user is not None:
+        return user
+
+
+def authenticate_user(
+    db_session: Session, username: str, password: str
+) -> HumanUserModel | Literal[False]:
+    user = get_user(db_session, username)
+    if not user:
+        password_hash.verify(password, DUMMY_HASH)
+        return False
+    if not password_hash.verify(password, user.hashed_password):
+        return False
+    return user
+
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(UTC) + expires_delta
+    else:
+        expire = datetime.now(UTC) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+async def get_current_user(
+    db_session: Annotated[Session, Depends(get_db_session)],
+    token: Annotated[str, Depends(oauth2_scheme)],
+) -> HumanUserModel:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except jwt.InvalidTokenError:
+        raise credentials_exception
+    user = get_user(db_session, username=username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+def generate_token(username: str) -> Token:
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": username}, expires_delta=access_token_expires
+    )
+    return Token(access_token=access_token, token_type="bearer")
+
 
 class BaseHeaders:
     def __init__(
         self,
-        user_id: Annotated[int | None, Header()],
         agent_id: Annotated[int | None, Header()] = None,
         session_id: Annotated[int | None, Header()] = None,
         parent_session_id: Annotated[int | None, Header()] = None,
     ):
-        self.user_id = user_id
+        self.user_id: int | None = None
         self.agent_id = agent_id
         self.session_id = session_id
         self.parent_session_id = parent_session_id
@@ -392,6 +471,7 @@ async def run_model_loop(
 
 class UserCreate(BaseModel):
     username: str
+    password: str
     fullname: str
     email: str
 
@@ -399,6 +479,7 @@ class UserCreate(BaseModel):
 class UserResponse(BaseModel):
     username: str
     user_id: int
+    token: Token
 
 
 @app.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -416,13 +497,33 @@ def signup(
         )
     new_user = HumanUserModel(
         username=user_details.username,
+        hashed_password=password_hash.hash(user_details.password),
         fullname=user_details.fullname,
         email=user_details.email,
         user=UserModel(),
     )
     db_session.add(new_user)
     db_session.commit()
-    return UserResponse(username=new_user.username, user_id=new_user.user_id)
+    return UserResponse(
+        username=new_user.username,
+        user_id=new_user.user_id,
+        token=generate_token(new_user.username),
+    )
+
+
+@app.post("/token")
+async def login_for_access_token(
+    db_session: Annotated[Session, Depends(get_db_session)],
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+) -> Token:
+    user = authenticate_user(db_session, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return generate_token(user.username)
 
 
 allowed_items = {"reasoning", "message", "function_call", "function_call_output"}
@@ -486,10 +587,11 @@ async def run_model(
     model_input: EasyInputMessage | HumanInputFromUser,
     db_session: Annotated[Session, Depends(get_db_session)],
     base_headers: Annotated[BaseHeaders, Depends()],
+    user: Annotated[HumanUserModel, Depends(get_current_user)],
 ) -> AsyncIterable[ServerSentEvent]:
-    print("wassup")
+    base_headers.user_id = user.user_id
     if base_headers.session_id is None:
-        session = SessionModel(user_id=base_headers.user_id)
+        session = SessionModel(user_id=user.user_id)
         db_session.add(session)
         db_session.commit()
         base_headers.session_id = session.session_id

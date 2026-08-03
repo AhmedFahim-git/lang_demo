@@ -28,8 +28,9 @@ class HumanUserModel(Base):
 
     human_user_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     username: Mapped[str] = mapped_column(
-        String(length=50), unique=True, nullable=False
+        String(length=50), unique=True, nullable=False, index=True
     )
+    hashed_password: Mapped[str] = mapped_column(String(length=200), nullable=False)
     fullname: Mapped[str] = mapped_column(String(length=50), nullable=False)
     email: Mapped[str] = mapped_column(String(length=50), unique=True, nullable=False)
     user_id: Mapped[int] = mapped_column(

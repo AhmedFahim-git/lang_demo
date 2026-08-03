@@ -24,7 +24,7 @@ def parse_sse(text: str) -> dict[str, Any]:
 
 
 async def process_human_input_request(
-    input_request: dict[str, Any], user_id: int, session_id: int | None = None
+    input_request: dict[str, Any], token: str, session_id: int | None = None
 ):
     tool_call_param, tool_call_output = (
         input_request["tool_call_param"],
@@ -67,7 +67,7 @@ async def process_human_input_request(
                     "tool_call_output": tool_call_output,
                     "human_input": human_json,
                 },
-                user_id=user_id,
+                token=token,
                 session_id=session_id,
             )
             break
@@ -76,9 +76,9 @@ async def process_human_input_request(
 
 
 async def send_message(
-    user_input: dict[str, Any], user_id: int, session_id: int | None = None
+    user_input: dict[str, Any], token: str, session_id: int | None = None
 ):
-    header = {"user-id": str(user_id)}
+    header = {"Authorization": f"Bearer {token}"}
     if session_id is not None:
         header["session-id"] = str(session_id)
     async with (
@@ -109,24 +109,36 @@ async def send_message(
             elif data["type"] == "human_input_required":
                 tg.create_task(
                     process_human_input_request(
-                        data, user_id=user_id, session_id=session_id
+                        data, token=token, session_id=session_id
                     )
                 )
 
 
 async def main():
+    user_details = {
+        "username": "my_user",
+        "password": "yoitsmepassword",
+        "fullname": "Edward Elric",
+        "email": "sth@yo.com",
+    }
     async with httpx.AsyncClient() as client:
         result = await client.post(
             "http://localhost:8000/signup",
-            json={
-                "username": "my_user",
-                "fullname": "Edward Elric",
-                "email": "sth@yo.com",
-            },
+            json=user_details,
         )
-        print(result.status_code)
-        print(result.json())
-        user_id: int = result.json().get("user_id")
+        if result.status_code == 201:
+            token = result.json().get("token").get("access_token")
+        elif result.status_code == 409:  # This is for login with existing user
+            print("yo here i am")
+            result = await client.post(
+                "http://localhost:8000/token",
+                data={
+                    "username": user_details.get("username"),
+                    "password": user_details.get("password"),
+                },
+            )
+            result.raise_for_status()
+            token = result.json().get("access_token")
     while True:
         # What is weather in Amsterdam? What is the current UTC time
         user_input = await get_input("User Input: ")
@@ -138,7 +150,7 @@ async def main():
                 "type": "message",
                 "content": [{"type": "input_text", "text": user_input}],
             },
-            user_id=user_id,
+            token=token,
         )
 
 
