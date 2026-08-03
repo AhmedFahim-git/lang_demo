@@ -573,6 +573,7 @@ def message_update_input_list_db(
                 message_time=datetime.now(UTC),
             )
         )
+    db_session.commit()
     if (isinstance(item, dict)) and (item.get("type") in allowed_items):
         if (item.get("type") == "function_call_output") and (
             item.get("status") != "completed"
@@ -664,4 +665,3 @@ async def run_model(
                 update_func=input_list_db_update_func,
             ):
                 yield sse_event
-    db_session.commit()
