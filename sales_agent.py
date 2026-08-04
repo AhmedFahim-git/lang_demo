@@ -572,14 +572,13 @@ def messages_to_input_list(
 def message_update_input_list_db(
     item: ResponseInputItemParam | HumanInputFromUser,
     input_list: ResponseInputParam,
-    base_headers: BaseHeaders,
+    session_id: int,
     db_session: Session,
 ) -> None:
     if isinstance(item, HumanInputFromUser):
         db_session.add(
             MessageModel(
-                session_id=base_headers.session_id,
-                parent_session_id=base_headers.parent_session_id,
+                session_id=session_id,
                 content=item.model_dump_json(),
                 message_time=datetime.now(UTC),
             )
@@ -587,8 +586,7 @@ def message_update_input_list_db(
     else:
         db_session.add(
             MessageModel(
-                session_id=base_headers.session_id,
-                parent_session_id=base_headers.parent_session_id,
+                session_id=session_id,
                 content=json.dumps(item),
                 message_time=datetime.now(UTC),
             )
@@ -602,37 +600,50 @@ def message_update_input_list_db(
         input_list.append(item)
 
 
+@app.get("/chat")
+async def make_chat_session(
+    db_session: Annotated[Session, Depends(get_db_session)],
+    user: Annotated[HumanUserModel, Depends(get_current_user)],
+):
+
+    session = SessionModel(user_id=user.user_id)
+    db_session.add(session)
+    db_session.commit()
+    return {"type": "session_init", "session_id": session.session_id}
+
+
+def validate_user_session(db_session: Session, user_id: int, session_id: int) -> bool:
+    stmt = select(SessionModel).where(
+        SessionModel.user_id == user_id, SessionModel.session_id == session_id
+    )
+    session = db_session.scalars(stmt).one_or_none()
+    return session is not None
+
+
 # Need to break up this function and remove print statements
-@app.post("/", response_class=EventSourceResponse)
+@app.post("/chat/{session_id}", response_class=EventSourceResponse)
 async def run_model(
+    session_id: int,
     model_input: EasyInputMessage | HumanInputFromUser,
     db_session: Annotated[Session, Depends(get_db_session)],
-    base_headers: Annotated[BaseHeaders, Depends()],
     user: Annotated[HumanUserModel, Depends(get_current_user)],
 ) -> AsyncIterable[ServerSentEvent]:
-    base_headers.user_id = user.user_id
-    if base_headers.session_id is None:
-        session = SessionModel(user_id=user.user_id)
-        db_session.add(session)
-        db_session.commit()
-        base_headers.session_id = session.session_id
-        yield ServerSentEvent(
-            data={"type": "session_init", "session_id": session.session_id}
-        )
-        message_list = []
-    else:
-        stmt = (
-            select(MessageModel)
-            .where(MessageModel.session_id == base_headers.session_id)
-            .order_by(MessageModel.message_time)
-        )
-        message_list = db_session.scalars(stmt).fetchall()
+    assert validate_user_session(
+        db_session=db_session, user_id=user.user_id, session_id=session_id
+    ), "Session not of User"
+    yield ServerSentEvent(comment=None)
+    stmt = (
+        select(MessageModel)
+        .where(MessageModel.session_id == session_id)
+        .order_by(MessageModel.message_time)
+    )
+    message_list = db_session.scalars(stmt).fetchall()
     yield ServerSentEvent(comment=None)
     input_list, pending_call_ids = messages_to_input_list(message_list)
     input_list_db_update_func = partial(
         message_update_input_list_db,
         input_list=input_list,
-        base_headers=base_headers,
+        session_id=session_id,
         db_session=db_session,
     )
     if isinstance(model_input, EasyInputMessage):

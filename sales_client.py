@@ -76,15 +76,18 @@ async def send_message(
     user_input: dict[str, Any], token: str, session_id: int | None = None
 ):
     header = {"Authorization": f"Bearer {token}"}
-    if session_id is not None:
-        header["session-id"] = str(session_id)
+    if session_id is None:
+        async with httpx.AsyncClient() as client:
+            res = await client.get("http://localhost:8000/chat", headers=header)
+        res.raise_for_status()
+        session_id = res.json().get("session_id")
     try:
         async with (
             asyncio.TaskGroup() as tg,
             httpx.AsyncClient() as client,
             client.stream(
                 method="POST",
-                url="http://localhost:8000",
+                url=f"http://localhost:8000/chat/{session_id}",
                 json=user_input,
                 headers=header,
             ) as stream_res,
@@ -95,9 +98,7 @@ async def send_message(
                 if "data" not in items:
                     continue
                 data: dict[str, Any] = items["data"]
-                if data["type"] == "session_init":
-                    session_id: int = data["session_id"]
-                elif data["type"] == "message":
+                if data["type"] == "message":
                     assert isinstance(data["content"], list)
                     for item in data["content"]:
                         if item["type"] == "refusal":
@@ -131,7 +132,6 @@ async def main():
         if result.status_code == 201:
             token = result.json().get("token").get("access_token")
         elif result.status_code == 409:  # This is for login with existing user
-            print("yo here i am")
             result = await client.post(
                 "http://localhost:8000/token",
                 data={
