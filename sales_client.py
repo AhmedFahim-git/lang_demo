@@ -63,8 +63,7 @@ async def process_human_input_request(
             await send_message(
                 {
                     "type": "human_input_from_user",
-                    "tool_call_param": tool_call_param,
-                    "tool_call_output": tool_call_output,
+                    "call_id": tool_call_param.get("call_id"),
                     "human_input": human_json,
                 },
                 token=token,

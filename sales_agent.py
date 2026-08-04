@@ -167,8 +167,7 @@ class HumanInputRequired(BaseModel):
 
 class HumanInputFromUser(BaseModel):
     type: Literal["human_input_from_user"]
-    tool_call_param: ResponseFunctionToolCall
-    tool_call_output: ResponseFunctionToolCallOutputItem
+    call_id: str
     human_input: dict[str, Any]
 
 
@@ -395,7 +394,9 @@ async def run_tool_call(
     tool_call: ResponseFunctionToolCall,
     tools_dict: dict[str, Callable[..., Awaitable[ToolOutput]]],
     update_func: Callable[[ResponseInputItemParam | HumanInputFromUser], None],
-    pending_call_ids: set[str],
+    pending_call_ids: dict[
+        str, tuple[ResponseFunctionToolCall, ResponseFunctionToolCallOutputItem]
+    ],
 ) -> list[ServerSentEvent]:
     res = await process_tool_call(tool_call=tool_call, tool=tools_dict[tool_call.name])
     call_output = res.output
@@ -405,7 +406,10 @@ async def run_tool_call(
         if item.type == "input_file":
             res_list.append(ServerSentEvent(data=item))
     if res.status == "in_progress":
-        pending_call_ids.add(tool_call.call_id)
+        pending_call_ids[res.call_id] = (
+            tool_call,
+            res,
+        )
         res_list.append(
             ServerSentEvent(
                 data=HumanInputRequired(
@@ -424,7 +428,9 @@ app = FastAPI()
 
 async def run_model_loop(
     input_list: ResponseInputParam,
-    pending_call_ids: set[str],
+    pending_call_ids: dict[
+        str, tuple[ResponseFunctionToolCall, ResponseFunctionToolCallOutputItem]
+    ],
     update_func: Callable[[ResponseInputItemParam | HumanInputFromUser], None],
 ) -> AsyncIterable[ServerSentEvent]:
     if pending_call_ids:
@@ -531,22 +537,33 @@ allowed_items = {"reasoning", "message", "function_call", "function_call_output"
 
 def messages_to_input_list(
     message_list: Sequence[MessageModel],
-) -> tuple[ResponseInputParam, set[str]]:
+) -> tuple[
+    ResponseInputParam,
+    dict[str, tuple[ResponseFunctionToolCall, ResponseFunctionToolCallOutputItem]],
+]:
     input_list = []
-    pending_call_ids = set()
+    pending_call_ids: dict[str, list] = {}
     for message in message_list:
         message_dict = json.loads(message.content)
         if message_dict.get("type") in allowed_items:
             if message_dict.get("type") == "function_call":
-                pending_call_ids.add(message_dict.get("call_id"))
+                pending_call_ids[message_dict.get("call_id")] = [
+                    ResponseFunctionToolCall(**message_dict),
+                    None,
+                ]
             elif message_dict.get("type") == "function_call_output":
                 if message_dict.get("status") == "completed":
-                    pending_call_ids.remove(message_dict.get("call_id"))
+                    # pending_call_ids.remove(message_dict.get("call_id"))
+                    pending_call_ids.pop(message_dict.get("call_id"))
+                elif message_dict.get("status") == "in_progress":
+                    pending_call_ids[message_dict.get("call_id")][1] = (
+                        ResponseFunctionToolCallOutputItem(**message_dict)
+                    )
                 else:
                     continue
 
         input_list.append(message_dict)
-    return input_list, pending_call_ids
+    return input_list, {k: tuple(v) for k, v in pending_call_ids.items()}
 
 
 def message_update_input_list_db(
@@ -631,33 +648,34 @@ async def run_model(
         ):
             yield sse_event
     elif isinstance(model_input, HumanInputFromUser):
-        if model_input.tool_call_param.call_id not in pending_call_ids:
+        if model_input.call_id not in pending_call_ids:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="This function call has already been processed",
             )
-        arguments_json: dict[str, Any] = json.loads(
-            model_input.tool_call_param.arguments
-        )
-        assert isinstance(model_input.tool_call_output.output[0], ResponseInputText)
-        model_def = model_input.tool_call_output.output[0].text
+        tool_call_param, tool_call_output = pending_call_ids[model_input.call_id]
+        arguments_json: dict[str, Any] = json.loads(tool_call_param.arguments)
+        assert isinstance(tool_call_output.output[0], ResponseInputText)
+        model_def = tool_call_output.output[0].text
         human_input_model = make_pydantic_model_from_def(model_def)
         human_input = human_input_model(**model_input.human_input)
         arguments_json.update(human_input.model_dump())
         arguments_json["human_input"] = True
-        model_input.tool_call_param.arguments = json.dumps(arguments_json)
+        tool_call_copy = tool_call_param.model_copy(
+            update={"arguments": json.dumps(arguments_json)}
+        )
         try:
-            pending_call_ids.remove(model_input.tool_call_param.call_id)
+            pending_call_ids.pop(model_input.call_id)
             for sse_event in await run_tool_call(
-                tool_call=model_input.tool_call_param,
+                tool_call=tool_call_copy,
                 tools_dict=tools_dict,
                 update_func=input_list_db_update_func,
                 pending_call_ids=pending_call_ids,
             ):
                 yield sse_event
         except Exception as e:
-            pending_call_ids.add(model_input.tool_call_param.call_id)
-            print(e)
+            pending_call_ids[model_input.call_id] = (tool_call_param, tool_call_output)
+            print(str(e))
         if not pending_call_ids:
             async for sse_event in run_model_loop(
                 input_list=input_list,
