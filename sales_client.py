@@ -33,10 +33,11 @@ async def process_human_input_request(
     await display_message(tool_call_param)
     await display_message(tool_call_output)
     assert isinstance(tool_call_output["output"], list)
-    message_def_str: str = ""
-    for item in tool_call_output["output"]:
-        if item.get("type") == "input_text":
-            message_def_str = item.get("text")
+    assert tool_call_output["output"][1].get("type") == "input_text"
+    message_def_str: str = tool_call_output["output"][1].get("text")
+    # for item in tool_call_output["output"]:
+    #     if item.get("type") == "input_text":
+    #         message_def_str = item.get("text")
     assert message_def_str
     message_def = json.loads(message_def_str)
 

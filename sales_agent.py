@@ -261,7 +261,6 @@ def get_model_def(
     for field, in_attrs in req_fields.items():
         field_info = fields_dict[field]
         field_info_dict = field_info.asdict()
-        print(field_info_dict)
         attributes = field_info_dict.get("attributes")
         metadata = field_info_dict.get("metadata")
         metadata_dict: dict[str, str | int | float | bool] = {}
@@ -307,7 +306,11 @@ async def get_weather(args: WeatherArgs) -> ToolOutput:
         return ToolOutput(
             status=FuncCallStatus.IN_PROGRESS,
             result=[
-                ResponseInputText(type="input_text", text=result.model_dump_json())
+                ResponseInputText(
+                    type="input_text",
+                    text="This should contain details or instruction on what human input to give. This part will also be shown to user",
+                ),
+                ResponseInputText(type="input_text", text=result.model_dump_json()),
             ],
         )
     return ToolOutput(
@@ -452,7 +455,6 @@ async def run_model_loop(
             elif item.type == "message":
                 yield ServerSentEvent(data=item)
         if not tool_calls:
-            print(f"reached case with no tool call: {input_list}")
             break
         tasks = [
             asyncio.create_task(
@@ -472,7 +474,6 @@ async def run_model_loop(
         if pending_call_ids:
             break
         tool_calls = []
-    print(f"Out of loop: {input_list}")
 
 
 class UserCreate(BaseModel):
@@ -631,7 +632,6 @@ async def run_model(
         base_headers=base_headers,
         db_session=db_session,
     )
-    print(model_input)
     if isinstance(model_input, EasyInputMessage):
         if pending_call_ids:
             raise HTTPException(
@@ -639,7 +639,6 @@ async def run_model(
                 detail="We should not be getting input while tool call human input is pending",
             )
         input_list_db_update_func(model_input.model_dump())
-        print(input_list)
         # Pending_call_ids is modified in place
         async for sse_event in run_model_loop(
             input_list=input_list,
@@ -655,8 +654,8 @@ async def run_model(
             )
         tool_call_param, tool_call_output = pending_call_ids[model_input.call_id]
         arguments_json: dict[str, Any] = json.loads(tool_call_param.arguments)
-        assert isinstance(tool_call_output.output[0], ResponseInputText)
-        model_def = tool_call_output.output[0].text
+        assert isinstance(tool_call_output.output[1], ResponseInputText)
+        model_def = tool_call_output.output[1].text
         human_input_model = make_pydantic_model_from_def(model_def)
         human_input = human_input_model(**model_input.human_input)
         arguments_json.update(human_input.model_dump())
@@ -673,9 +672,8 @@ async def run_model(
                 pending_call_ids=pending_call_ids,
             ):
                 yield sse_event
-        except Exception as e:
+        except Exception:
             pending_call_ids[model_input.call_id] = (tool_call_param, tool_call_output)
-            print(str(e))
         if not pending_call_ids:
             async for sse_event in run_model_loop(
                 input_list=input_list,
