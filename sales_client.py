@@ -35,9 +35,6 @@ async def process_human_input_request(
     assert isinstance(tool_call_output["output"], list)
     assert tool_call_output["output"][1].get("type") == "input_text"
     message_def_str: str = tool_call_output["output"][1].get("text")
-    # for item in tool_call_output["output"]:
-    #     if item.get("type") == "input_text":
-    #         message_def_str = item.get("text")
     assert message_def_str
     message_def = json.loads(message_def_str)
 
@@ -81,37 +78,42 @@ async def send_message(
     header = {"Authorization": f"Bearer {token}"}
     if session_id is not None:
         header["session-id"] = str(session_id)
-    async with (
-        asyncio.TaskGroup() as tg,
-        httpx.AsyncClient() as client,
-        client.stream(
-            method="POST",
-            url="http://localhost:8000",
-            json=user_input,
-            headers=header,
-        ) as stream_res,
-    ):
-        stream_res.raise_for_status()
-        async for text in stream_res.aiter_text():
-            items = parse_sse(text)
-            data: dict[str, Any] = items["data"]
-            if data["type"] == "session_init":
-                session_id: int = data["session_id"]
-            elif data["type"] == "message":
-                assert isinstance(data["content"], list)
-                for item in data["content"]:
-                    if item["type"] == "refusal":
-                        await display_message(item["refusal"])
-                    if item["type"] == "output_text":
-                        await display_message(item["text"])
-            elif data["type"] == "input_file":
-                await display_message(data["file_url"])
-            elif data["type"] == "human_input_required":
-                tg.create_task(
-                    process_human_input_request(
-                        data, token=token, session_id=session_id
+    try:
+        async with (
+            asyncio.TaskGroup() as tg,
+            httpx.AsyncClient() as client,
+            client.stream(
+                method="POST",
+                url="http://localhost:8000",
+                json=user_input,
+                headers=header,
+            ) as stream_res,
+        ):
+            stream_res.raise_for_status()
+            async for text in stream_res.aiter_text():
+                items = parse_sse(text)
+                if "data" not in items:
+                    continue
+                data: dict[str, Any] = items["data"]
+                if data["type"] == "session_init":
+                    session_id: int = data["session_id"]
+                elif data["type"] == "message":
+                    assert isinstance(data["content"], list)
+                    for item in data["content"]:
+                        if item["type"] == "refusal":
+                            await display_message(item["refusal"])
+                        if item["type"] == "output_text":
+                            await display_message(item["text"])
+                elif data["type"] == "input_file":
+                    await display_message(data["file_url"])
+                elif data["type"] == "human_input_required":
+                    tg.create_task(
+                        process_human_input_request(
+                            data, token=token, session_id=session_id
+                        )
                     )
-                )
+    except ExceptionGroup as e:
+        print(e.exceptions)
 
 
 async def main():

@@ -404,7 +404,7 @@ async def run_tool_call(
     res = await process_tool_call(tool_call=tool_call, tool=tools_dict[tool_call.name])
     call_output = res.output
     assert isinstance(call_output, list)
-    res_list: list[ServerSentEvent] = []
+    res_list: list[ServerSentEvent] = [ServerSentEvent(comment=None)]
     for item in call_output:
         if item.type == "input_file":
             res_list.append(ServerSentEvent(data=item))
@@ -448,6 +448,7 @@ async def run_model_loop(
             tools=tools_json_list,
             input=input_list,
         )
+        yield ServerSentEvent(comment=None)
         append_output(response_output=response.output, update_func=update_func)
         for item in response.output:
             if item.type == "function_call":
@@ -471,6 +472,7 @@ async def run_model_loop(
             res = await task
             for item in res:
                 yield item
+        yield ServerSentEvent(comment=None)
         if pending_call_ids:
             break
         tool_calls = []
@@ -625,6 +627,7 @@ async def run_model(
             .order_by(MessageModel.message_time)
         )
         message_list = db_session.scalars(stmt).fetchall()
+    yield ServerSentEvent(comment=None)
     input_list, pending_call_ids = messages_to_input_list(message_list)
     input_list_db_update_func = partial(
         message_update_input_list_db,
@@ -663,6 +666,7 @@ async def run_model(
         tool_call_copy = tool_call_param.model_copy(
             update={"arguments": json.dumps(arguments_json)}
         )
+        yield ServerSentEvent(comment=None)
         try:
             pending_call_ids.pop(model_input.call_id)
             for sse_event in await run_tool_call(
