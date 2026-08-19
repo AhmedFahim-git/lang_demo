@@ -1,21 +1,32 @@
 from collections.abc import Awaitable, Callable
+from copy import copy
 from datetime import UTC, datetime
+from functools import partial
 from inspect import signature
 
+import httpx
+from a2a.client import A2ACardResolver, ClientConfig, create_client
+from a2a.helpers import get_message_text, new_text_message
+from a2a.types import Role, SendMessageRequest
 from browser_use import Agent, Browser, ChatOpenAI
 from openai import pydantic_function_tool
 from openai.types.responses import (
     FunctionToolParam,
     ResponseInputText,
 )
+from sqlalchemy.orm import Session
 
+from llm_utils.core.settings import settings
+from llm_utils.db.db_utils import get_agents
 from llm_utils.models.model_utils import get_model_def
 from llm_utils.models.tool_models import (
+    BaseA2AArgs,
     BrowserUseArgs,
     FuncCallStatus,
     TimeArgs,
     ToolOutput,
     WeatherArgs,
+    get_a2a_arg,
 )
 
 
@@ -106,4 +117,41 @@ async def get_time(args: TimeArgs) -> ToolOutput:
     )
 
 
-TOOLS_DICT = get_tool_name_dict([use_browser, get_weather, get_time])
+async def run_a2a_base(args: BaseA2AArgs, agent_id: int) -> ToolOutput:
+    async with httpx.AsyncClient() as httpx_client:
+        resolver = A2ACardResolver(
+            httpx_client=httpx_client, base_url=f"{settings.a2a_base_url}/{agent_id}"
+        )
+        public_card = await resolver.get_agent_card()
+    config = ClientConfig(streaming=True)
+    client = await create_client(agent=public_card, client_config=config)
+    message = new_text_message(text=args.a2a_input, role=Role.ROLE_USER)
+    request = SendMessageRequest(message=message)
+    async for chunk in client.send_message(request=request):
+        if chunk.HasField("message"):
+            return ToolOutput(
+                result=[
+                    ResponseInputText(
+                        type="input_text", text=get_message_text(chunk.message)
+                    )
+                ]
+            )
+    return ToolOutput(result=[])
+
+
+def get_tools_dict(
+    db_session: Session | None = None,
+) -> dict[str, Callable[..., Awaitable[ToolOutput]]]:
+    tools_list = [use_browser, get_weather, get_time]
+    if db_session is not None:
+        agents = get_agents(db_session)
+        for agent in agents:
+            agent_func = partial(copy(run_a2a_base), agent_id=agent.agent_user_id)
+            agent_func.__name__ = agent.agent_name
+            # Even in ADK, agent card description is used
+            agent_func.func.__annotations__["args"] = get_a2a_arg(
+                agent.agent_description
+            )
+            tools_list.append(agent_func)
+
+    return get_tool_name_dict(tools_list)

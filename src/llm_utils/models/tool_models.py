@@ -1,45 +1,10 @@
-import asyncio
-import json
-import uuid
-from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
-from datetime import UTC, datetime, timedelta
 from enum import Enum
-from functools import partial
-from inspect import signature
-from typing import Annotated, Any, Literal, TypedDict
 
-import jwt
-from annotated_types import Ge, Gt, Le, Lt, MaxLen, MinLen, MultipleOf
-from browser_use import Agent, Browser, ChatOpenAI
-from fastapi import Depends, FastAPI, Header, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.sse import EventSourceResponse, ServerSentEvent
-from openai import AsyncOpenAI, pydantic_function_tool
-from openai.types.responses import (
-    EasyInputMessage,
-    FunctionToolParam,
-    ResponseFunctionToolCall,
-    ResponseFunctionToolCallOutputItem,
-    ResponseFunctionToolCallParam,
-    ResponseInputItemParam,
-    ResponseInputParam,
-    ResponseInputText,
-    ResponseOutputItem,
-    ResponseOutputMessageParam,
-    ResponseReasoningItemParam,
-)
 from openai.types.responses.response_custom_tool_call_output import (
     OutputOutputContentList,
 )
-from openai.types.responses.response_input_param import FunctionCallOutput
-from pwdlib import PasswordHash
-from pydantic import BaseModel, Field, Strict, create_model
-from pydantic.fields import FieldInfo
+from pydantic import BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema
-from sqlalchemy import select
-from sqlalchemy.orm import (
-    Session,
-)
 
 
 class FuncCallStatus(str, Enum):
@@ -74,3 +39,13 @@ class WeatherArgs(ToolInput):
 
 class TimeArgs(ToolInput):
     __doc__ = "This function is for getting current UTC time in isoformat"
+
+
+class BaseA2AArgs(ToolInput):
+    a2a_input: str = Field(description="The input text for A2A Agent")
+
+
+def get_a2a_arg(doc: str):
+    new_arg = BaseA2AArgs
+    new_arg.__doc__ = doc
+    return new_arg

@@ -9,7 +9,7 @@ from llm_utils.auth.auth import (
     hash_password,
     verify_password,
 )
-from llm_utils.db.schema import HumanUserModel, UserModel
+from llm_utils.db.schema import AgentUserModel, HumanUserModel, UserModel
 from llm_utils.models.auth_models import Token
 from llm_utils.models.user_models import UserCreate
 
@@ -17,6 +17,13 @@ from llm_utils.models.user_models import UserCreate
 class UserService:
     def __init__(self, db_session: Session):
         self._db_session = db_session
+
+
+class AgentUserService(UserService):
+    def get_user_from_agent_id(self, agent_id: int) -> AgentUserModel | None:
+        stmt = select(AgentUserModel).where(AgentUserModel.agent_user_id == agent_id)
+        agent_user = self._db_session.scalars(stmt).one_or_none()
+        return agent_user
 
 
 class HumanUserService(UserService):

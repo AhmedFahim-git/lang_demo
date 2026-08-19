@@ -24,14 +24,16 @@ from openai.types.responses import (
     ResponseReasoningItemParam,
 )
 from openai.types.responses.response_input_param import FunctionCallOutput
-from sqlalchemy import select
+from sqlalchemy import case, or_, select
 from sqlalchemy.orm import Session
 
-from llm_utils.db.schema import MessageModel
+from llm_utils.db.schema import AgentUserModel, MessageModel
 from llm_utils.models.model_utils import make_pydantic_model_from_def
 from llm_utils.models.response_models import HumanInputFromUser, HumanInputRequired
 from llm_utils.models.tool_models import ToolOutput
-from llm_utils.tools.tools import TOOLS_DICT, get_tool_json_list
+from llm_utils.tools.tools import get_tool_json_list, get_tools_dict
+
+from .session_service import SessionService
 
 
 class AgentService:
@@ -45,9 +47,27 @@ class AgentService:
         self.client = client
         self.session_id = session_id
         self._db_session = db_session
-        self.tools = ["use_browser", "get_weather", "get_time"]
+        user = SessionService(db_session).get_user_from_session_id(session_id)
+        assert user is not None
+        stmt = (
+            select(AgentUserModel)
+            .where(
+                or_(
+                    AgentUserModel.user_id == user.user_id,
+                    AgentUserModel.agent_user_id == 1,
+                )
+            )
+            .order_by(case((AgentUserModel.user_id == user.user_id, 0), else_=1))
+            .limit(1)
+        )
+        agent = db_session.scalars(stmt).one()
+        self.system_prompt = agent.system_prompt  # "You are a helpful agent"
+        self.tools: list[str] = json.loads(
+            agent.tools_list
+        )  # ["use_browser", "get_weather", "get_time"]
+        self.tools_dict = get_tools_dict(db_session=db_session)
         self.tools_json_list = get_tool_json_list(
-            [TOOLS_DICT[item] for item in self.tools]
+            [self.tools_dict[item] for item in self.tools]
         )
 
         messages = self._get_prev_messages()
@@ -158,7 +178,7 @@ class AgentService:
     ]:
         # ) -> list[ServerSentEvent]:
         res = await self.process_tool_call(
-            tool_call=tool_call, tool=TOOLS_DICT[tool_call.name]
+            tool_call=tool_call, tool=self.tools_dict[tool_call.name]
         )
         call_output = res.output
         assert isinstance(call_output, list)
@@ -197,6 +217,7 @@ class AgentService:
         | HumanInputRequired
     ]:
         if self.pending_call_ids:
+            # TODO: We should not be dong HTTP exceptions here
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="We should not be create model response while tool call human input is pending",
@@ -204,7 +225,7 @@ class AgentService:
         tool_calls: list[ResponseFunctionToolCall] = []
         while True:
             response = await self.client.responses.create(
-                instructions="You are a helpful agent",
+                instructions=self.system_prompt,
                 tools=self.tools_json_list,
                 input=self.input_list,
             )
@@ -245,6 +266,7 @@ class AgentService:
 
         if isinstance(model_input, EasyInputMessage):
             if self.pending_call_ids:
+                # TODO: We should not be dong HTTP exceptions here
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="We should not be getting input while tool call human input is pending",
@@ -255,6 +277,7 @@ class AgentService:
 
         elif isinstance(model_input, HumanInputFromUser):
             if model_input.call_id not in self.pending_call_ids:
+                # TODO: We should not be dong HTTP exceptions here
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="This function call has already been processed",
@@ -278,6 +301,7 @@ class AgentService:
                     tool_call=tool_call_copy,
                 ):
                     yield model_output_or_input_req
+            # TODO: Don't catch exception like this. It is recipe for disaster
             except Exception:
                 self.pending_call_ids[model_input.call_id] = (
                     tool_call_param,

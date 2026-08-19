@@ -3,11 +3,11 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.sse import EventSourceResponse, ServerSentEvent
-from openai import AsyncOpenAI
 from openai.types.responses import EasyInputMessage
 from sqlalchemy.orm import Session
 
 from llm_utils.auth.auth import oauth2_scheme
+from llm_utils.core.settings import settings
 from llm_utils.db.db_utils import get_db_session
 from llm_utils.db.schema import UserModel
 from llm_utils.models.response_models import HumanInputFromUser
@@ -19,8 +19,8 @@ from llm_utils.services.user_service import HumanUserService
 router = APIRouter()
 
 
-def get_client() -> AsyncOpenAI:
-    return AsyncOpenAI(api_key="None", base_url="http://localhost:8080/v1")
+# def get_client() -> AsyncOpenAI:
+#     return AsyncOpenAI(api_key="None", base_url="http://localhost:8080/v1")
 
 
 def make_session(
@@ -63,7 +63,6 @@ async def run_model(
     session_id: int,
     model_input: EasyInputMessage | HumanInputFromUser,
     db_session: Annotated[Session, Depends(get_db_session)],
-    client: Annotated[AsyncOpenAI, Depends(get_client)],
     user: Annotated[UserModel | None, Depends(get_current_user)],
 ) -> AsyncIterable[ServerSentEvent]:
     assert user
@@ -71,7 +70,7 @@ async def run_model(
         user.user_id, session_id
     )
     agent_service = AgentService(
-        db_session=db_session, client=client, session_id=session_id
+        db_session=db_session, client=settings.openai_client, session_id=session_id
     )
     async for response in agent_service.run_model(model_input):
         yield ServerSentEvent(data=response, retry=5)

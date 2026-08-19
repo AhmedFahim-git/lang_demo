@@ -26,7 +26,7 @@ def authenticate_user(
     return human_user_service.authenticate_user(form_data.username, form_data.password)
 
 
-@router.get("/token")
+@router.post("/token")
 async def login_for_access_token(
     user: Annotated[HumanUserModel | None, Depends(authenticate_user)],
 ) -> Token:

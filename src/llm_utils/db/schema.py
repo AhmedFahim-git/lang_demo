@@ -45,7 +45,7 @@ class AgentUserModel(Base):
     agent_description: Mapped[str] = mapped_column(Text, nullable=False)
     system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     tools_list: Mapped[str] = mapped_column(
-        Text
+        Text, default="[]", nullable=False
     )  # Comma separated list of tool names (can be more sophisticated later on)
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.user_id"), nullable=False, unique=True
