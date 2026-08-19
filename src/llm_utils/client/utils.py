@@ -53,25 +53,25 @@ async def process_human_input_request(
     ]
     # TODO: Replace while with for loop to limit max number of retries. Keep max retries in a Constant
     while True:
-        try:
-            human_input = await get_input(
-                "Provide Requested information in json format: "
-            )  # It should be {"feedback":"some feedback"}
-            # human_input = '{"feedback": "some feedback"}'
-            human_json: dict[str, Any] = json.loads(human_input)
-            assert all(field in human_json for field in required_fields)
-            await send_message(
-                {
-                    "type": "human_input_from_user",
-                    "call_id": tool_call_param.get("call_id"),
-                    "human_input": human_json,
-                },
-                token=token,
-                session_id=session_id,
-            )
-            break
-        except Exception as e:
-            await display_message(str(e))
+        # try:
+        human_input = await get_input(
+            "Provide Requested information in json format: "
+        )  # It should be {"feedback":"some feedback"}
+        # human_input = '{"feedback": "some feedback"}'
+        human_json: dict[str, Any] = json.loads(human_input)
+        assert all(field in human_json for field in required_fields)
+        await send_message(
+            {
+                "type": "human_input_from_user",
+                "call_id": tool_call_param.get("call_id"),
+                "human_input": human_json,
+            },
+            token=token,
+            session_id=session_id,
+        )
+        break
+    # except Exception as e:
+    #     await display_message(str(e))
 
 
 async def send_message(
@@ -95,6 +95,7 @@ async def send_message(
                 url=f"{settings.agent_base_url}/chat/{session_id}",
                 json=user_input,
                 headers=header,
+                timeout=timeout,
             ) as stream_res,
         ):
             stream_res.raise_for_status()

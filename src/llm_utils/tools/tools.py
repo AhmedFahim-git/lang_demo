@@ -5,7 +5,14 @@ from functools import partial
 from inspect import signature
 
 import httpx
-from a2a.client import A2ACardResolver, ClientConfig, create_client
+from a2a.client import (
+    A2ACardResolver,
+    AuthInterceptor,
+    ClientCallContext,
+    ClientConfig,
+    CredentialService,
+    create_client,
+)
 from a2a.helpers import get_message_text, new_text_message
 from a2a.types import Role, SendMessageRequest
 from browser_use import Agent, Browser, ChatOpenAI
@@ -117,6 +124,21 @@ async def get_time(args: TimeArgs) -> ToolOutput:
     )
 
 
+class APICredentilService(CredentialService):
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+
+    async def get_credentials(
+        self,
+        security_scheme_name: str,
+        context: ClientCallContext | None,
+    ) -> str | None:
+        if security_scheme_name == "apikey":
+            return self.api_key
+        else:
+            return None
+
+
 async def run_a2a_base(args: BaseA2AArgs, agent_id: int) -> ToolOutput:
     async with httpx.AsyncClient() as httpx_client:
         resolver = A2ACardResolver(
@@ -124,7 +146,10 @@ async def run_a2a_base(args: BaseA2AArgs, agent_id: int) -> ToolOutput:
         )
         public_card = await resolver.get_agent_card()
     config = ClientConfig(streaming=True)
-    client = await create_client(agent=public_card, client_config=config)
+    interceptor = AuthInterceptor(APICredentilService(settings.a2a_api_key))
+    client = await create_client(
+        agent=public_card, client_config=config, interceptors=[interceptor]
+    )
     message = new_text_message(text=args.a2a_input, role=Role.ROLE_USER)
     request = SendMessageRequest(message=message)
     async for chunk in client.send_message(request=request):

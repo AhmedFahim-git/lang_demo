@@ -5,10 +5,11 @@ import jwt
 from fastapi.security import OAuth2PasswordBearer
 from pwdlib import PasswordHash
 
+from llm_utils.core.settings import settings
 from llm_utils.models.auth_models import Token
 
 # Generated using "openssl rand -hex 32". Move this to a .env
-SECRET_KEY = "bd121e4ec165595a80f1cd5da97e80318fe0c0484c24739697c037aab9bd04a2"
+SECRET_KEY = settings.auth_token_secret_key
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 

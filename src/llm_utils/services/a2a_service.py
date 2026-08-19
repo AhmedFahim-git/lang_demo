@@ -9,7 +9,11 @@ from a2a.types import (
     AgentCard,
     AgentInterface,
     AgentSkill,
+    APIKeySecurityScheme,
     Role,
+    SecurityRequirement,
+    SecurityScheme,
+    StringList,
 )
 from openai.types.responses import (
     EasyInputMessage,
@@ -43,8 +47,12 @@ class BaseAgentExecutor(AgentExecutor):
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         # TODO: Add mapping from context id to session id
+        if not context.call_context.user.is_authenticated:
+            raise PermissionError("Authentication failed")
+        if "a2a:invoke" not in context.call_context.state["auth"].scopes:
+            raise PermissionError("Missing a2a:invoke scope")
+
         session_id = self.get_chat_session()
-        # TODO: Add security schemes and requirements
         agent_service = AgentService(
             client=settings.openai_client,
             session_id=session_id,
@@ -110,6 +118,7 @@ class A2AService:
             protocol_binding="JSONRPC",
         )
         capabilities = AgentCapabilities(streaming=True)
+
         return AgentCard(
             name=self.agent_executor.agent.agent_name,
             description=self.agent_executor.agent.agent_description,
@@ -118,6 +127,16 @@ class A2AService:
             default_input_modes=["text/plain"],
             default_output_modes=["text/plain"],
             skills=[skill],
+            security_schemes={
+                "apikey": SecurityScheme(
+                    api_key_security_scheme=APIKeySecurityScheme(
+                        description="some desc", location="header", name="x-api-key"
+                    )
+                )
+            },
+            security_requirements=[
+                SecurityRequirement(schemes={"apikey": StringList(list="a2a:invoke")})
+            ],
         )
 
     def get_agent_card_routes(self) -> list[Route]:
