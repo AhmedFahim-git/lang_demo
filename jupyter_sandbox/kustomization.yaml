@@ -1,0 +1,3 @@
+resources:
+  - sandboxtemplate.yaml
+  - sandboxwarmpool.yaml

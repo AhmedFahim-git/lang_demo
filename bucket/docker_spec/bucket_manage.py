@@ -7,10 +7,12 @@ from typing import Annotated
 
 import boto3
 import botocore
-from fastapi import BackgroundTasks, FastAPI, Form, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import BackgroundTasks, FastAPI, Form, UploadFile, status
+from fastapi.responses import FileResponse, JSONResponse
 
 app = FastAPI()
+
+# TODO: In terms of authentication, it might be good idea to not expose the base get upload or download url. Instead make sub methods that extend that function
 
 
 # TODO: bucket name need to be extracted into config
@@ -27,63 +29,120 @@ def ensure_bucket(s3_client, bucket_name="my-bucket"):
     return True
 
 
-@app.get("/")
+@app.get("/", response_class=JSONResponse)
 async def check_bucket():
     try:
         s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
         created_bool = ensure_bucket(s3_client=s3)
         assert created_bool
-        return {"status": "success"}
+        return JSONResponse(
+            content={"status": "success"}, status_code=status.HTTP_201_CREATED
+        )
+        # return {"status": "success"}
     except Exception:
-        return {"status": "failed", "exception": traceback.format_exc()}
+        return JSONResponse(
+            content={"status": "failed", "exception": traceback.format_exc()},
+            status_code=status.HTTP_409_CONFLICT,
+        )
 
 
-@app.get("/upload_file_link/")
-async def get_post_link(file: str, userid: str, sessionid: str):
+# TODO: Convention is for dir_name to start with / not end with /
+@app.get("/upload_file_link", response_class=JSONResponse)
+async def get_post_link(path_in_bucket: str = ""):
     s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+    # if path_in_bucket:
+    #     path_in_bucket = f"{path_in_bucket.strip('/')}/{file_name}"
+    # else:
+    #     path_in_bucket = file_name
+    # TODO: Check if file exists
     url = s3.generate_presigned_post(
         "my-bucket",
-        f"users/{userid}/{sessionid}/file_dir/{file}",
-        Conditions=[
-            ["content-length-range", 0, 5 * 1024 * 1024]  # 0–5 MB
-        ],
-    )
-    print(url)
-    return {"status": "success", "url": url}
-
-
-@app.get("/upload_file_link_rag/")
-async def get_post_link_rag(file: str, dir_name: str | None = "pdfs/"):
-    s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
-    if dir_name:
-        dir_name = f'dir_name.strip("/")/{file}'
-    else:
-        dir_name = file
-    url = s3.generate_presigned_post(
-        "my-bucket",
-        dir_name,
+        path_in_bucket,
         Conditions=[
             ["content-length-range", 0, 50 * 1024 * 1024]  # 0–50 MB
         ],
     )
-    print(url)
-    return {"status": "success", "url": url}
+    # print(url)
+    return JSONResponse(content={"status": "success", "url": url})
 
 
-@app.get("/download_file_link/")
-async def get_presigned_url(file: str, userid: str, sessionid: str):
-    s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
-    url = s3.generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": "my-bucket",
-            "Key": f"users/{userid}/{sessionid}/file_dir/{file}",
-        },
+# TODO: This would require some auth
+@app.get("/upload_file_link_user_session", response_class=JSONResponse)
+async def get_post_link_user_session(file_name: str, userid: int, sessionid: int):
+    return await get_post_link(
+        path_in_bucket=f"users/{userid}/{sessionid}/file_dir/{file_name}"
     )
-    return {"status": "success", "url": url}
+    # s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+    # url = s3.generate_presigned_post(
+    #     "my-bucket",
+    #     f"users/{userid}/{sessionid}/file_dir/{file}",
+    #     Conditions=[
+    #         ["content-length-range", 0, 5 * 1024 * 1024]  # 0–5 MB
+    #     ],
+    # )
+    # print(url)
+    # return {"status": "success", "url": url}
 
 
-@app.post("/uploadfile/")
+# TODO: This would require some auth
+@app.get("/download_file_link", response_class=JSONResponse)
+async def get_presigned_url(path_in_bucket: str = ""):
+    s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+    # if path_in_bucket:
+    #     path_in_bucket = f"{path_in_bucket.strip('/')}/{file_name}"
+    # else:
+    #     path_in_bucket = file_name
+    # TODO: Check if file exists
+    url = s3.generate_presigned_url(
+        "get_object", Params={"Bucket": "my-bucket", "Key": path_in_bucket}
+    )
+    return JSONResponse({"status": "success", "url": url})
+
+
+@app.get("/download_file_link_user_session", response_class=JSONResponse)
+async def get_presigned_url_user_session(file_name: str, userid: int, sessionid: int):
+    return await get_presigned_url(
+        path_in_bucket=f"users/{userid}/{sessionid}/file_dir/{file_name}"
+    )
+    # s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+    # url = s3.generate_presigned_url(
+    #     "get_object",
+    #     Params={
+    #         "Bucket": "my-bucket",
+    #         "Key": f"users/{userid}/{sessionid}/file_dir/{file}",
+    #     },
+    # )
+    # return {"status": "success", "url": url}
+
+
+@app.get("/exists", response_class=JSONResponse)
+async def check_exists(path_in_bucket: str = ""):
+    s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+    status_code, exists = status.HTTP_500_INTERNAL_SERVER_ERROR, False
+    try:
+        s3.head_object(Bucket="my-bucket", Key=path_in_bucket)
+        status_code = status.HTTP_200_OK
+        exists = True
+    except botocore.exceptions.ClientError as e:
+        status_code = int(e.response["Error"]["Code"])
+    return JSONResponse(
+        content={"path": path_in_bucket, "exists": exists}, status_code=status_code
+    )
+
+
+@app.get("/list_objects", response_class=JSONResponse)
+async def list_objects(path_in_bucket: str = ""):
+    s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+    response = s3.list_objects_v2(
+        Bucket="my-bucket", Prefix=f"{path_in_bucket.strip('/')}/"
+    )
+    items = []
+    for obj in response.get("Contents", []):
+        items.append(obj["Key"])
+    return JSONResponse(content=items, status_code=status.HTTP_200_OK)
+
+
+@app.post("/uploadfile")
 async def upload_file(
     files: list[UploadFile],
     userid: Annotated[str, Form()],
@@ -98,7 +157,7 @@ async def upload_file(
             s3.upload_fileobj(
                 file.file,
                 "my-bucket",
-                f"users/{userid}/{sessionid}/file_dir/{str(file.filename)}",
+                f"users/{userid}/{sessionid}/file_dir/{file.filename!s}",
             )
             files_up.append(str(file.filename))
         return {"status": "success", "files_uploaded": files_up}
@@ -106,7 +165,7 @@ async def upload_file(
         return {"status": "failed", "files_uploaded": files_up, "error": str(e)}
 
 
-@app.get("/downloadfile/")
+@app.get("/downloadfile")
 async def download_file(
     background_tasks: BackgroundTasks, files: list[str], userid: str, sessionid: str
 ):

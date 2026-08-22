@@ -1,0 +1,7 @@
+resources:
+  - sandbox_router.yaml
+
+namespace: agent-sandbox-system
+
+# commonLabels:
+#   app: sandbox-router
